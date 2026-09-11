@@ -7,8 +7,6 @@ cp scripts/cluster.env.example scripts/cluster.env   # IP、用户、网卡，�
 ./scripts/dsv41-serve.sh                             # 默认 300K 档
 ```
 
-用法与同目录下已验证的 [`GLM-5.3-Flash-FP8-6x-DGX-Spark`](GLM-5.3-Flash-FP8-6x-DGX-Spark) 对齐：同一套 `cluster.env` + `lib.sh` + `*-serve.sh` / `*-node-launch.sh` / `*-container-entrypoint.sh` 结构，同样的 `start|stop|status|logs|dry-run` 动词。
-
 不要把 IP 或用户名写进启动脚本里。`cluster.env` 已被 gitignore。
 
 > 老路径 `launch/dsv41-tp4.sh` / `launch/boot_dsv41.sh` / `launch/bootN-go.sh` 原样保留，仍然可用；`patch/` 下七个 bind-mount 文件也没有被这次重构改动（`weight_utils.py` md5 仍是 `7e1027f1`）。
