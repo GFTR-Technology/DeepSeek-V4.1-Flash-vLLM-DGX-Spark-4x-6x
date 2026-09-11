@@ -1,0 +1,48 @@
+spark-9de7:7:7 [0] NCCL INFO NET/IB : Using [0]rocep1s0f0:1/RoCE [RO]; OOB enp1s0f0np0:192.168.192.2<0>
+spark-9de7:7:7 [0] NCCL INFO Using network IB
+spark-9de7:7:7 [0] NCCL INFO Channel 00/64 : 0 1 2 3
+spark-9de7:7:7 [0] NCCL INFO Channel 00/0 : 3[0] -> 0[0] [receive] via NET/IB/0
+REDDIE  r0 per-op us, 8KB                       n=  300 p10=   47.90 p50=   49.06 p90=  171.87 max=  672.13 slow(>1.25x p10)= 13%
+REDDIE  r0 per-op us, 32KB                      n=  300 p10=   53.12 p50=   55.20 p90=   79.78 max=  382.85 slow(>1.25x p10)= 12%
+REDDIE  r0 per-op us, 60KB                      n=  300 p10=   58.02 p50=   60.16 p90=   64.10 max=  382.88 slow(>1.25x p10)=  4%
+REDDIE  r0 per-op us, 128KB                     n=  300 p10=   78.50 p50=   80.80 p90=   88.74 max=  228.22 slow(>1.25x p10)=  5%
+REDDIE  r0 per-op us, 256KB                     n=  300 p10=  108.29 p50=  114.59 p90=  129.76 max=  587.84 slow(>1.25x p10)=  6%
+REDDIE  r0 per-op us, 1024KB                    n=  300 p10=  772.77 p50=  799.71 p90=  841.60 max= 1493.25 slow(>1.25x p10)=  2%
+REDDIE  r0 eager step ms, gaps only             n=   40 p10=   52.29 p50=   52.29 p90=   52.29 max=   62.82 slow(>1.25x p10)=  0%
+REDDIE  r0 eager step ms, 88 AR + gaps          n=  150 p10=   57.13 p50=   57.16 p90=   57.33 max=   71.97 slow(>1.25x p10)=  1% | collective cost/step p50=4.87 ms | 1s medians: 57.2 57.2 57.2 57.1 57.1 57.1 57.1 57.1 57.1
+REDDIE  r0 graph step ms, 88 AR + gaps          n=  300 p10=   57.83 p50=   58.01 p90=   58.28 max=   58.72 slow(>1.25x p10)=  0% | collective cost/step p50=5.72 ms | 1s medians: 58.1 58.1 57.9 58.1 58.0 58.0 58.2 58.0 58.0 58.0 58.0 58.1 58.1 58.0 58.1 57.9 58.0 57.9
+REDDIE  r0 graph step ms, 88 AR back-to-back    n= 2000 p10=    5.02 p50=    5.31 p90=    5.68 max=    6.80 slow(>1.25x p10)=  0% | 1s medians: 5.3 5.3 5.3 5.4 5.4 5.4 5.4 5.3 5.3 5.3 5.2
+REDDIE r0 done
+SPARK4  r1 per-op us, 8KB                       n=  300 p10=   48.64 p50=   49.06 p90=  171.94 max=  672.03 slow(>1.25x p10)= 12%
+SPARK4  r1 per-op us, 32KB                      n=  300 p10=   53.12 p50=   55.17 p90=   81.86 max=  384.86 slow(>1.25x p10)= 11%
+SPARK4  r1 per-op us, 60KB                      n=  300 p10=   57.28 p50=   60.19 p90=   65.31 max=  387.04 slow(>1.25x p10)=  4%
+SPARK4  r1 per-op us, 128KB                     n=  300 p10=   78.62 p50=   80.86 p90=   87.74 max=  223.07 slow(>1.25x p10)=  4%
+SPARK4  r1 per-op us, 256KB                     n=  300 p10=  108.32 p50=  114.69 p90=  126.98 max=  593.89 slow(>1.25x p10)=  7%
+SPARK4  r1 per-op us, 1024KB                    n=  300 p10=  771.90 p50=  801.60 p90=  842.62 max= 1482.59 slow(>1.25x p10)=  2%
+SPARK4  r1 eager step ms, gaps only             n=   40 p10=   52.78 p50=   52.78 p90=   52.78 max=   54.54 slow(>1.25x p10)=  0%
+SPARK4  r1 eager step ms, 88 AR + gaps          n=  150 p10=   57.13 p50=   57.15 p90=   57.33 max=   60.98 slow(>1.25x p10)=  0% | collective cost/step p50=4.37 ms | 1s medians: 57.2 57.2 57.2 57.1 57.1 57.1 57.1 57.1 57.1
+SPARK4  r1 graph step ms, 88 AR + gaps          n=  300 p10=   57.83 p50=   58.01 p90=   58.28 max=   66.70 slow(>1.25x p10)=  0% | collective cost/step p50=5.22 ms | 1s medians: 58.1 58.1 57.9 58.1 58.0 58.0 58.2 58.0 58.0 58.0 58.0 58.1 58.2 58.1 58.1 57.9 58.0 57.9
+SPARK4  r1 graph step ms, 88 AR back-to-back    n= 2000 p10=    5.02 p50=    5.31 p90=    5.68 max=    6.78 slow(>1.25x p10)=  0% | 1s medians: 5.3 5.3 5.3 5.4 5.4 5.4 5.4 5.3 5.3 5.3 5.2
+SPARK4 r1 done
+ASUSI   r2 per-op us, 8KB                       n=  300 p10=   47.84 p50=   49.54 p90=  172.80 max=  662.72 slow(>1.25x p10)= 13%
+ASUSI   r2 per-op us, 32KB                      n=  300 p10=   52.93 p50=   56.03 p90=   75.81 max=  390.05 slow(>1.25x p10)= 12%
+ASUSI   r2 per-op us, 60KB                      n=  300 p10=   57.34 p50=   59.94 p90=   64.22 max=  393.06 slow(>1.25x p10)=  4%
+ASUSI   r2 per-op us, 128KB                     n=  300 p10=   78.59 p50=   80.93 p90=   87.04 max=  228.10 slow(>1.25x p10)=  4%
+ASUSI   r2 per-op us, 256KB                     n=  300 p10=  109.22 p50=  114.66 p90=  126.88 max=  592.64 slow(>1.25x p10)=  6%
+ASUSI   r2 per-op us, 1024KB                    n=  300 p10=  773.79 p50=  802.30 p90=  841.54 max= 1452.83 slow(>1.25x p10)=  2%
+ASUSI   r2 eager step ms, gaps only             n=   40 p10=   52.58 p50=   52.59 p90=   52.59 max=   54.59 slow(>1.25x p10)=  0%
+ASUSI   r2 eager step ms, 88 AR + gaps          n=  150 p10=   57.13 p50=   57.15 p90=   57.33 max=   68.60 slow(>1.25x p10)=  0% | collective cost/step p50=4.57 ms | 1s medians: 57.2 57.2 57.2 57.2 57.1 57.2 57.1 57.1 57.1
+ASUSI   r2 graph step ms, 88 AR + gaps          n=  300 p10=   57.83 p50=   58.00 p90=   58.28 max=   66.19 slow(>1.25x p10)=  0% | collective cost/step p50=5.42 ms | 1s medians: 58.1 58.1 57.9 58.1 58.0 58.0 58.2 58.0 58.0 58.0 58.0 58.1 58.2 58.1 58.1 57.9 58.0 57.9
+ASUSI   r2 graph step ms, 88 AR back-to-back    n= 2000 p10=    5.02 p50=    5.31 p90=    5.68 max=    6.80 slow(>1.25x p10)=  0% | 1s medians: 5.3 5.3 5.3 5.4 5.4 5.4 5.4 5.3 5.3 5.3 5.2
+ASUSI r2 done
+BLUEY   r3 per-op us, 8KB                       n=  300 p10=   47.84 p50=   49.02 p90=  173.41 max=  673.86 slow(>1.25x p10)= 13%
+BLUEY   r3 per-op us, 32KB                      n=  300 p10=   53.06 p50=   55.10 p90=   79.68 max=  396.99 slow(>1.25x p10)= 12%
+BLUEY   r3 per-op us, 60KB                      n=  300 p10=   57.22 p50=   59.30 p90=   64.35 max=  395.07 slow(>1.25x p10)=  4%
+BLUEY   r3 per-op us, 128KB                     n=  300 p10=   77.66 p50=   80.74 p90=   87.62 max=  230.14 slow(>1.25x p10)=  5%
+BLUEY   r3 per-op us, 256KB                     n=  300 p10=  107.30 p50=  115.36 p90=  128.22 max=  588.51 slow(>1.25x p10)=  6%
+BLUEY   r3 per-op us, 1024KB                    n=  300 p10=  772.48 p50=  800.19 p90=  841.38 max= 1490.78 slow(>1.25x p10)=  2%
+BLUEY   r3 eager step ms, gaps only             n=   40 p10=   52.65 p50=   52.65 p90=   52.65 max=   63.18 slow(>1.25x p10)=  0%
+BLUEY   r3 eager step ms, 88 AR + gaps          n=  150 p10=   57.13 p50=   57.16 p90=   57.33 max=   57.60 slow(>1.25x p10)=  0% | collective cost/step p50=4.50 ms | 1s medians: 57.2 57.2 57.2 57.1 57.1 57.1 57.1 57.1 57.1
+BLUEY   r3 graph step ms, 88 AR + gaps          n=  300 p10=   57.83 p50=   58.00 p90=   58.28 max=   58.71 slow(>1.25x p10)=  0% | collective cost/step p50=5.35 ms | 1s medians: 58.1 58.1 57.9 58.1 58.0 58.0 58.2 58.0 58.0 58.0 58.0 58.1 58.1 58.1 58.2 57.9 58.0 57.9
+BLUEY   r3 graph step ms, 88 AR back-to-back    n= 2000 p10=    5.02 p50=    5.31 p90=    5.67 max=    6.80 slow(>1.25x p10)=  0% | 1s medians: 5.3 5.3 5.3 5.4 5.4 5.4 5.4 5.3 5.3 5.3 5.2
+BLUEY r3 done

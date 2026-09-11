@@ -1,0 +1,112 @@
+2026-09-10T08:47:17.905370126Z (APIServer pid=1) INFO 09-10 08:47:17 [api_utils.py:347] 
+2026-09-10T08:47:17.905393870Z (APIServer pid=1) INFO 09-10 08:47:17 [api_utils.py:347]        █     █     █▄   ▄█
+2026-09-10T08:47:17.905395838Z (APIServer pid=1) INFO 09-10 08:47:17 [api_utils.py:347]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.28.1rc1.dev388+g8a728663c
+2026-09-10T08:47:17.905397086Z (APIServer pid=1) INFO 09-10 08:47:17 [api_utils.py:347]   █▄█▀ █     █     █     █  model   /models/DeepSeek-V4.1-Flash
+2026-09-10T08:47:17.905399438Z (APIServer pid=1) INFO 09-10 08:47:17 [api_utils.py:347]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+2026-09-10T08:47:17.905400574Z (APIServer pid=1) INFO 09-10 08:47:17 [api_utils.py:347] 
+2026-09-10T08:47:17.908782448Z (APIServer pid=1) INFO 09-10 08:47:17 [api_utils.py:286] non-default args: {'model_tag': '/models/DeepSeek-V4.1-Flash', 'default_chat_template_kwargs': {'thinking': False}, 'host': '0.0.0.0', 'model': '/models/DeepSeek-V4.1-Flash', 'max_model_len': 131072, 'enforce_eager': True, 'served_model_name': ['deepseek-v4.1-flash'], 'distributed_executor_backend': 'mp', 'master_addr': '192.168.192.2', 'master_port': 29541, 'nnodes': 4, 'tensor_parallel_size': 4, 'gpu_memory_utilization': 0.8, 'language_model_only': True, 'max_num_batched_tokens': 8192, 'max_num_seqs': 8, 'engram_config': EngramConfig(cpu_offload=False)}
+2026-09-10T08:47:17.916095953Z (APIServer pid=1) INFO 09-10 08:47:17 [config.py:801] Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.
+2026-09-10T08:47:27.329492114Z (APIServer pid=1) INFO 09-10 08:47:27 [model.py:692] Resolved architecture: DeepseekV41ForCausalLM
+2026-09-10T08:47:27.329519346Z (APIServer pid=1) INFO 09-10 08:47:27 [model.py:715] Defaulting to tokenizer_mode='deepseek_v41' for DeepseekV41ForCausalLM
+2026-09-10T08:47:27.329522274Z (APIServer pid=1) INFO 09-10 08:47:27 [model.py:2034] Using max model len 131072
+2026-09-10T08:47:29.311339759Z (APIServer pid=1) INFO 09-10 08:47:29 [registry.py:141] All limits of multimodal modalities supported by the model are set to 0, running in text-only mode.
+2026-09-10T08:47:29.311645502Z (APIServer pid=1) INFO 09-10 08:47:29 [model.py:900] Disabled mm_prefix attention mode because multimodal inputs are configuration-disabled. Attention backends without mm_prefix support may now be selected.
+2026-09-10T08:47:30.010406755Z (APIServer pid=1) INFO 09-10 08:47:30 [arg_utils.py:2232] Inferred data_parallel_rank 0 from node_rank 0
+2026-09-10T08:47:30.010429187Z (APIServer pid=1) INFO 09-10 08:47:30 [scheduler.py:277] Chunked prefill is enabled with max_num_batched_tokens=8192.
+2026-09-10T08:47:30.010625954Z (APIServer pid=1) INFO 09-10 08:47:30 [vllm.py:1107] Resolved Engram configuration: EngramConfig(cpu_offload=False)
+2026-09-10T08:47:30.010629970Z (APIServer pid=1) WARNING 09-10 08:47:30 [vllm.py:1406] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+2026-09-10T08:47:30.011178144Z (APIServer pid=1) INFO 09-10 08:47:30 [vllm.py:734] Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out.
+2026-09-10T08:47:30.011200767Z (APIServer pid=1) INFO 09-10 08:47:30 [kernel.py:373] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+2026-09-10T08:47:30.011220367Z (APIServer pid=1) INFO 09-10 08:47:30 [vllm.py:1620] Cudagraph is disabled under eager mode
+2026-09-10T08:47:30.019703262Z (APIServer pid=1) INFO 09-10 08:47:30 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+2026-09-10T08:47:35.008194357Z (EngineCore pid=197) INFO 09-10 08:47:35 [core.py:123] Initializing a V1 LLM engine (v0.28.1rc1.dev388+g8a728663c) with config: model='/models/DeepSeek-V4.1-Flash', speculative_config=None, tokenizer='/models/DeepSeek-V4.1-Flash', skip_tokenizer_init=False, tokenizer_mode=deepseek_v41, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=131072, download_dir=None, load_format=auto, tensor_parallel_size=4, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=deepseek_v4_fp8, quantization_config=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, per_request_spec_decode_metrics='none', kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=deepseek-v4.1-flash, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['+quant_fp8', 'all', '+quant_fp8'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+2026-09-10T08:47:35.008809043Z (EngineCore pid=197) INFO 09-10 08:47:35 [multiproc_executor.py:153] DP group leader: node_rank=0, node_rank_within_dp=0, master_addr=192.168.192.2, mq_connect_ip=192.168.192.2 (local), world_size=4, local_world_size=1
+2026-09-10T08:47:40.910184807Z INFO 09-10 08:47:40 [registry.py:141] All limits of multimodal modalities supported by the model are set to 0, running in text-only mode.
+2026-09-10T08:47:40.938064589Z (Worker pid=269) INFO 09-10 08:47:40 [parallel_state.py:1798] world_size=4 rank=0 local_rank=0 distributed_init_method=tcp://192.168.192.2:29541 backend=nccl
+2026-09-10T08:47:57.442449165Z (Worker pid=269) INFO 09-10 08:47:57 [pynccl.py:120] vLLM is using nccl==2.30.7
+2026-09-10T08:48:02.995823159Z (Worker pid=269) WARNING 09-10 08:48:02 [symm_mem.py:67] SymmMemCommunicator: Device capability 12.1 not supported, communicator is not available.
+2026-09-10T08:48:03.023439096Z (Worker pid=269) WARNING 09-10 08:48:03 [flashinfer_all_reduce.py:383] FlashInfer All Reduce is disabled because it is not supported for world_size=4.
+2026-09-10T08:48:03.040852524Z (Worker pid=269) WARNING 09-10 08:48:03 [custom_all_reduce.py:201] Custom collectives are disabled because this multi-node group does not have MNNVL-capable GPUs on every rank.
+2026-09-10T08:48:03.040880652Z (Worker pid=269) INFO 09-10 08:48:03 [cuda_communicator.py:296] Using ['PYNCCL'] all-reduce backends (in dispatch order) for group 'tp:0' out of potential backends: ['FLASHINFER_PCIE_IPC', 'FLASHINFER', 'NCCL_SYMM_MEM', 'QUICK_REDUCE', 'AITER_CUSTOM', 'CUSTOM', 'SYMM_MEM', 'PYNCCL'].
+2026-09-10T08:48:08.305231707Z (Worker pid=269) INFO 09-10 08:48:08 [cuda_communicator.py:296] Using ['PYNCCL'] all-reduce backends (in dispatch order) for group 'ep:0' out of potential backends: ['FLASHINFER_PCIE_IPC', 'FLASHINFER', 'NCCL_SYMM_MEM', 'QUICK_REDUCE', 'AITER_CUSTOM', 'CUSTOM', 'SYMM_MEM', 'PYNCCL'].
+2026-09-10T08:48:08.305267787Z (Worker pid=269) INFO 09-10 08:48:08 [parallel_state.py:2142] rank 0 in world size 4 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+2026-09-10T08:48:08.305271115Z (Worker pid=269) INFO 09-10 08:48:08 [gpu_worker.py:436] Using V2 Model Runner
+2026-09-10T08:48:08.671380312Z (Worker_TP0 pid=269) INFO 09-10 08:48:08 [model_runner.py:383] Loading model from scratch...
+2026-09-10T08:48:08.688086736Z (Worker_TP0 pid=269) INFO 09-10 08:48:08 [cuda.py:581] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention
+2026-09-10T08:48:08.688109664Z (Worker_TP0 pid=269) INFO 09-10 08:48:08 [mm_encoder_attention.py:372] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.
+2026-09-10T08:48:08.719794325Z (Worker_TP0 pid=269) INFO 09-10 08:48:08 [quant_config.py:79] DeepSeek V4 expert_dtype resolved to 'fp4'
+2026-09-10T08:48:08.724439365Z (Worker_TP0 pid=269) INFO 09-10 08:48:08 [__init__.py:889] Using FlashInferCutlassMxfp8LinearKernel for MXFP8 GEMM
+2026-09-10T08:48:08.884634921Z (Worker_TP0 pid=269) INFO 09-10 08:48:08 [attention.py:140] Using DeepSeek's fp8_ds_mla KV cache format.
+2026-09-10T08:48:08.936233019Z (Worker_TP0 pid=269) INFO 09-10 08:48:08 [mxfp4.py:715] Using 'DEEPGEMM_MXFP4' Mxfp4 MoE backend.
+2026-09-10T08:48:10.794711348Z (Worker_TP0 pid=269) INFO 09-10 08:48:10 [engram.py:656] Engram DISK mode: layer 1 rows read from model-00047-of-00048.safetensors (off=664) and model-00047-of-00048.safetensors (off=98305579672); 32 threads, chunk 16
+2026-09-10T08:48:10.801343805Z (Worker_TP0 pid=269) INFO 09-10 08:48:10 [engram.py:771] Engram table DISK-backed: 96000564 rows x 256 per rank stay on disk (23.60 GiB not allocated)
+2026-09-10T08:48:10.926250492Z (Worker_TP0 pid=269) INFO 09-10 08:48:10 [attention.py:1065] Using FP8 indexer cache for Lightning Indexer.
+2026-09-10T08:48:11.914546640Z (Worker_TP0 pid=269) INFO 09-10 08:48:11 [engram.py:656] Engram DISK mode: layer 14 rows read from model-00048-of-00048.safetensors (off=672) and model-00048-of-00048.safetensors (off=98308271264); 32 threads, chunk 16
+2026-09-10T08:48:11.917668070Z (Worker_TP0 pid=269) INFO 09-10 08:48:11 [engram.py:771] Engram table DISK-backed: 96003054 rows x 256 per rank stay on disk (23.60 GiB not allocated)
+2026-09-10T08:48:14.695173166Z (Worker_TP0 pid=269) INFO 09-10 08:48:14 [engram.py:438] Built engram token map (129280 -> 99092 ids) for layers (1, 14)
+2026-09-10T08:48:14.758389102Z (Worker_TP0 pid=269) WARNING 09-10 08:48:14 [compilation.py:1354] Op 'quant_fp8' not present in model, enabling with '+quant_fp8' has no effect
+2026-09-10T08:48:14.838015512Z (Worker_TP0 pid=269) INFO 09-10 08:48:14 [weight_utils.py:865] Filesystem type for checkpoints: EXT4. Checkpoint size: 475.25 GiB. Available RAM: 24.19 GiB.
+2026-09-10T08:48:14.838043480Z (Worker_TP0 pid=269) INFO 09-10 08:48:14 [weight_utils.py:895] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre) and the checkpoint size (475.25 GiB) exceeds 90% of available RAM (24.19 GiB).
+2026-09-10T08:48:14.838506006Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:   0% Completed | 0/48 [00:00<?, ?it/s]
+2026-09-10T08:48:15.769023695Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:   6% Completed | 3/48 [00:00<00:13,  3.22it/s]
+2026-09-10T08:48:16.884391801Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:   8% Completed | 4/48 [00:02<00:25,  1.75it/s]
+2026-09-10T08:48:17.992510780Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  10% Completed | 5/48 [00:03<00:31,  1.35it/s]
+2026-09-10T08:48:19.286836586Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  12% Completed | 6/48 [00:04<00:38,  1.10it/s]
+2026-09-10T08:48:20.331155216Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  15% Completed | 7/48 [00:05<00:39,  1.05it/s]
+2026-09-10T08:48:21.329535447Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  17% Completed | 8/48 [00:06<00:38,  1.03it/s]
+2026-09-10T08:48:22.387772703Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  19% Completed | 9/48 [00:07<00:38,  1.01it/s]
+2026-09-10T08:48:23.359778615Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  21% Completed | 10/48 [00:08<00:37,  1.01it/s]
+2026-09-10T08:48:24.335727983Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  23% Completed | 11/48 [00:09<00:36,  1.02it/s]
+2026-09-10T08:48:25.478551578Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  25% Completed | 12/48 [00:10<00:37,  1.03s/it]
+2026-09-10T08:48:26.678219686Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  27% Completed | 13/48 [00:11<00:37,  1.08s/it]
+2026-09-10T08:48:27.913895221Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  29% Completed | 14/48 [00:13<00:38,  1.13s/it]
+2026-09-10T08:48:28.979840165Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  31% Completed | 15/48 [00:14<00:36,  1.11s/it]
+2026-09-10T08:48:30.067024788Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  33% Completed | 16/48 [00:15<00:35,  1.10s/it]
+2026-09-10T08:48:31.297565278Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  35% Completed | 17/48 [00:16<00:35,  1.14s/it]
+2026-09-10T08:48:32.513185866Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  38% Completed | 18/48 [00:17<00:34,  1.16s/it]
+2026-09-10T08:48:33.518216630Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  40% Completed | 19/48 [00:18<00:32,  1.12s/it]
+2026-09-10T08:48:34.483519799Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  42% Completed | 20/48 [00:19<00:29,  1.07s/it]
+2026-09-10T08:48:35.516359531Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  44% Completed | 21/48 [00:20<00:28,  1.06s/it]
+2026-09-10T08:48:36.552567251Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  46% Completed | 22/48 [00:21<00:27,  1.05s/it]
+2026-09-10T08:48:37.632531656Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  48% Completed | 23/48 [00:22<00:26,  1.06s/it]
+2026-09-10T08:48:38.719674167Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  50% Completed | 24/48 [00:23<00:25,  1.07s/it]
+2026-09-10T08:48:39.764036405Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  52% Completed | 25/48 [00:24<00:24,  1.06s/it]
+2026-09-10T08:48:40.996664665Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  54% Completed | 26/48 [00:26<00:24,  1.11s/it]
+2026-09-10T08:48:42.079996774Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  56% Completed | 27/48 [00:27<00:23,  1.10s/it]
+2026-09-10T08:48:43.246294483Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  58% Completed | 28/48 [00:28<00:22,  1.12s/it]
+2026-09-10T08:48:44.285098112Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  60% Completed | 29/48 [00:29<00:20,  1.10s/it]
+2026-09-10T08:48:45.415775637Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  62% Completed | 30/48 [00:30<00:19,  1.11s/it]
+2026-09-10T08:48:46.501924777Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  65% Completed | 31/48 [00:31<00:18,  1.10s/it]
+2026-09-10T08:48:47.550277784Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  67% Completed | 32/48 [00:32<00:17,  1.09s/it]
+2026-09-10T08:48:48.627741956Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  69% Completed | 33/48 [00:33<00:16,  1.08s/it]
+2026-09-10T08:48:49.636252720Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  71% Completed | 34/48 [00:34<00:14,  1.06s/it]
+2026-09-10T08:48:50.841925011Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  73% Completed | 35/48 [00:36<00:14,  1.10s/it]
+2026-09-10T08:48:51.794996615Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  75% Completed | 36/48 [00:36<00:12,  1.06s/it]
+2026-09-10T08:48:52.796577233Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  77% Completed | 37/48 [00:37<00:11,  1.04s/it]
+2026-09-10T08:48:53.811485812Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  79% Completed | 38/48 [00:38<00:10,  1.03s/it]
+2026-09-10T08:48:54.846693804Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  81% Completed | 39/48 [00:40<00:09,  1.03s/it]
+2026-09-10T08:48:55.953895630Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  83% Completed | 40/48 [00:41<00:08,  1.06s/it]
+2026-09-10T08:48:56.915280124Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  85% Completed | 41/48 [00:42<00:07,  1.03s/it]
+2026-09-10T08:48:57.915230029Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  88% Completed | 42/48 [00:43<00:06,  1.02s/it]
+2026-09-10T08:48:58.252896784Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  92% Completed | 44/48 [00:43<00:02,  1.60it/s]
+2026-09-10T08:48:58.602267941Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  94% Completed | 45/48 [00:43<00:01,  1.79it/s]
+2026-09-10T08:48:58.936857442Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards:  96% Completed | 46/48 [00:44<00:00,  2.00it/s]
+2026-09-10T08:48:58.939747322Z (Worker_TP0 pid=269) Loading safetensors checkpoint shards: 100% Completed | 48/48 [00:44<00:00,  1.09it/s]
+2026-09-10T08:48:58.939757802Z (Worker_TP0 pid=269) 
+2026-09-10T08:51:56.495787733Z (Worker_TP0 pid=269) INFO 09-10 08:51:56 [default_loader.py:430] Loading weights took 221.64 seconds
+2026-09-10T08:51:56.501083745Z (Worker_TP0 pid=269) INFO 09-10 08:51:56 [__init__.py:889] Using EmulationMxfp8LinearKernel for MXFP8 GEMM
+2026-09-10T08:51:56.826051300Z (Worker_TP0 pid=269) INFO 09-10 08:51:56 [deep_gemm.py:191] deep_gemm not found in site-packages, trying vendored vllm.third_party.deep_gemm
+2026-09-10T08:51:56.840511289Z (Worker_TP0 pid=269) INFO 09-10 08:51:56 [deep_gemm.py:218] DeepGEMM PDL enabled on vllm.third_party.deep_gemm.
+2026-09-10T08:51:56.840544697Z (Worker_TP0 pid=269) INFO 09-10 08:51:56 [deep_gemm.py:136] DeepGEMM E8M0 enabled on current platform.
+2026-09-10T08:51:58.152226536Z (Worker_TP0 pid=269) INFO 09-10 08:51:58 [mxfp4.py:1973] Using MoEPrepareAndFinalizeNoDPEPModular
+2026-09-10T08:51:58.152246328Z (Worker_TP0 pid=269) INFO 09-10 08:51:58 [mxfp4.py:1974] Using DeepGemmFP4Experts
+2026-09-10T08:52:00.925138077Z (Worker_TP0 pid=269) INFO 09-10 08:52:00 [model_runner.py:408] Model loading took 78.79 GiB memory and 232.432717 seconds
+2026-09-10T08:52:00.961821652Z (Worker_TP0 pid=269) INFO 09-10 08:52:00 [topk_topp_sampler.py:62] Using FlashInfer for top-p & top-k sampling.
+2026-09-10T08:52:00.962475107Z (Worker_TP0 pid=269) INFO 09-10 08:52:00 [interface.py:635] Setting kv cache block size to 64 for FLASHINFER_MLA_SPARSE_DSV41 backend.
+2026-09-10T08:53:52.006596058Z (EngineCore pid=197) INFO 09-10 08:53:52 [torch_utils.py:280] Reducing Torch threads from 20 to 1 for serving. Set OMP_NUM_THREADS in the external environment to override.
+2026-09-10T08:53:52.011918412Z (EngineCore pid=197) INFO 09-10 08:53:52 [utils.py:306] Using BLHNC KV cache layout.
+2026-09-10T08:54:01.926894149Z (Worker_TP0 pid=269) 2026-09-10 08:53:55  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:129): TileLang begins to compile kernel `mhc_pre_big_fuse_with_norm_tilelang` with `out_idx=None`
+2026-09-10T08:54:01.926940181Z (Worker_TP0 pid=269) 2026-09-10 08:54:00  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang completes to compile kernel `mhc_pre_big_fuse_with_norm_tilelang`
+2026-09-10T08:54:01.927262517Z (Worker_TP0 pid=269) 2026-09-10 08:54:01,926 - INFO - core.py:447 - flashinfer.jit: Building JIT module mxfp8_gemm_cutlass_sm120; this can take several minutes on first use.
+2026-09-10T08:54:57.250821143Z (EngineCore pid=197) INFO 09-10 08:54:54 [shm_broadcast.py:801] No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work (e.g. compilation, weight/kv cache quantization).
+2026-09-10T08:56:01.258894676Z (EngineCore pid=197) INFO 09-10 08:55:57 [shm_broadcast.py:801] No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work (e.g. compilation, weight/kv cache quantization).

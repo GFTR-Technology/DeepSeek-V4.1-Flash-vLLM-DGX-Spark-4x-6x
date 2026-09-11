@@ -1,0 +1,16 @@
+--- orig/v1/attention/backends/mla/sparse_swa.py	2026-09-10 03:05:49
++++ patched/sparse_swa.py	2026-09-10 05:03:55
+@@ -139,6 +139,13 @@
+         return [MultipleOf(32)]
+ 
+     @classmethod
++    def get_swa_block_size(cls) -> int:
++        """Tech2Wild/Kai 2026-09-10: tokens per SWA cache page handed to
++        DeepseekV4SWACache. FlashMLA / TRTLLM-gen take the page size at
++        runtime (32); kernels instantiated for one page size override this."""
++        return 32
++
++    @classmethod
+     def get_preferred_block_size(cls, default_block_size: int) -> int:
+         return 256
+ 

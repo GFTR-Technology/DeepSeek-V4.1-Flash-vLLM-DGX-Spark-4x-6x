@@ -1,0 +1,46 @@
+--- /private/tmp/claude-501/-Users-tonyd2wild-Desktop-2Wild-s-Closet/fb5fd5e2-7d4c-4cda-9c5d-0e3e3b4eedbd/scratchpad/engramfix2/engram.py.offsetfix	2026-09-10 07:55:19
++++ /private/tmp/claude-501/-Users-tonyd2wild-Desktop-2Wild-s-Closet/fb5fd5e2-7d4c-4cda-9c5d-0e3e3b4eedbd/scratchpad/engramfix2/engram.py	2026-09-10 07:55:19
+@@ -695,7 +695,10 @@
+         start = meta["data_offsets"][0]
+         return fd, 8 + n + start, tuple(meta["shape"])
+ 
+-    def _read_rows(self, fd: int, base: int, rel: list, row_bytes: int, buf) -> None:
++    def _submit_rows(self, fd: int, base: int, rel: list, row_bytes: int, buf) -> list:
++        """Start the row reads and return their futures ([] if done inline). Small
++        decode batches are spread over the pool too: at decode each layer needs only
++        ~6 rows per rank, and serial preads cost ~1 ms each over NFS."""
+         def work(lo: int, hi: int) -> None:
+             for i in range(lo, hi):
+                 off = base + rel[i] * row_bytes
+@@ -708,11 +711,14 @@
+                     got += n
+ 
+         n = len(rel)
+-        if n <= self.chunk:
++        chunk = max(1, min(self.chunk, -(-n // self.threads)))
++        if n <= 1:
+             work(0, n)
+-            return
+-        futs = [self.pool.submit(work, lo, min(lo + self.chunk, n)) for lo in range(0, n, self.chunk)]
+-        for fut in futs:
++            return []
++        return [self.pool.submit(work, lo, min(lo + chunk, n)) for lo in range(0, n, chunk)]
++
++    def _read_rows(self, fd: int, base: int, rel: list, row_bytes: int, buf) -> None:
++        for fut in self._submit_rows(fd, base, rel, row_bytes, buf):
+             fut.result()
+ 
+     def gather_dequant(self, rel: torch.Tensor, owned: torch.Tensor) -> torch.Tensor:
+@@ -721,8 +727,10 @@
+         w = torch.empty((R, self.dim), dtype=torch.uint8)
+         s = torch.empty((R, self.sb), dtype=torch.uint8)
+         rel_l = rel.tolist()
+-        self._read_rows(self.w_fd, self.w_off, rel_l, self.dim, memoryview(w.numpy()).cast("B"))
+-        self._read_rows(self.s_fd, self.s_off, rel_l, self.sb, memoryview(s.numpy()).cast("B"))
++        futs = self._submit_rows(self.w_fd, self.w_off, rel_l, self.dim, memoryview(w.numpy()).cast("B"))
++        futs += self._submit_rows(self.s_fd, self.s_off, rel_l, self.sb, memoryview(s.numpy()).cast("B"))
++        for fut in futs:
++            fut.result()
+         vals = w.view(torch.float8_e4m3fn).to(torch.float32).view(R, self.sb, -1)
+         # ue8m0 byte is the fp32 exponent field: 2^(e-127)
+         scale = (s.to(torch.int32) << 23).view(torch.float32)

@@ -1,0 +1,7 @@
+ASUSI   FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF---------FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF----------  fast 62s slow 0s | F: 2184 MHz 21.7 W
+BLUEY   FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF---------FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF----------  fast 62s slow 0s | F: 2171 MHz 22.4 W
+REDDIE  FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF---------FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF----------  fast 62s slow 0s | F: 2190 MHz 22.8 W
+SPARK4  FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF---------FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF----------  fast 62s slow 0s | F: 2190 MHz 21.2 W
+summary no samples ('')
+shared seconds 60: all 4 fast 60s, at least one slow 0s (start skew 1s)
+(F fast state, s slow state, - copy block)

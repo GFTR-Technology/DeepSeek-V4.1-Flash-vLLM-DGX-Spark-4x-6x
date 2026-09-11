@@ -1,0 +1,90 @@
+--- /Users/tonyd2wild/Desktop/2Wild's Closet/dsv41-repo/launch/dsv41-tp4.sh	2026-09-10 05:18:13
++++ patch/dsv41-tp4.sh	2026-09-10 07:59:36
+@@ -11,8 +11,12 @@
+ #   MAXLEN       --max-model-len (default 131072)
+ #   SEQS         --max-num-seqs (default 8)
+ #   MAX_BATCHED  --max-num-batched-tokens (default 8192)
+-#   EAGER        1 => --enforce-eager (default 1). 0 => CUDAGRAPH_MODE (default PIECEWISE)
+-#   SPEC         none (default) | dspark  (dspark = recipe config, k=5, adaptive verification)
++#   EAGER        1 => --enforce-eager (default 1). 0 => CUDA graphs, CUDAGRAPH_MODE (default FULL_AND_PIECEWISE)
++#                   EAGER=0 with ENGRAM_DISK=1 NEEDS the prestage patch (engram.py + nvidia/model_state.py)
++#   CG_SIZES     capture sizes, comma list. Default: dspark -> every multiple of k and k+1 up to SEQS*(k+1)
++#                (each decode batch has an exact FULL graph: no padded rows, FlashInfer #5015); none -> 1..SEQS
++#   SPEC_ADAPT   adaptive verification (default false: it forces varlen FULL graphs = padded rows, #5015)
++#   SPEC         none (default) | dspark  (dspark = recipe config, k=5)
+ #   ENGRAM_DISK  1 (default) => bind-mount the disk-backed Engram patch + DSV41_ENGRAM_DISK=1
+ #   TEXT_ONLY    1 (default) => --language-model-only
+ #   THINKING     false (default) => --default-chat-template-kwargs '{"thinking": false}'
+@@ -29,7 +33,8 @@
+ SEQS="${SEQS:-8}"
+ MAX_BATCHED="${MAX_BATCHED:-8192}"
+ EAGER="${EAGER:-1}"
+-CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-PIECEWISE}"
++CUDAGRAPH_MODE="${CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}"
++CG_SIZES="${CG_SIZES:-}"
+ SPEC="${SPEC:-none}"
+ ENGRAM_DISK="${ENGRAM_DISK:-1}"
+ TEXT_ONLY="${TEXT_ONLY:-1}"
+@@ -65,7 +70,7 @@
+   # manifest: "<file> <site-relative path>" per line; ENGRAM_DISK=0 skips the engram files
+   while read -r f rel; do
+     [ -z "$f" ] && continue
+-    if [ "$ENGRAM_DISK" != "1" ] && { [ "$f" = "engram.py" ] || [ "$f" = "weight_utils.py" ]; }; then continue; fi
++    if [ "$ENGRAM_DISK" != "1" ] && { [ "$f" = "engram.py" ] || [ "$f" = "weight_utils.py" ] || [ "$f" = "model_state.py" ]; }; then continue; fi
+     test -f "$PATCH_DIR/$f" || { echo "PATCH FILE MISSING: $PATCH_DIR/$f" >&2; exit 3; }
+     PATCH_MOUNTS="$PATCH_MOUNTS -v $PATCH_DIR/$f:$SITE/$rel:ro"
+   done < "$PATCH_DIR/mounts.txt"
+@@ -83,8 +88,29 @@
+ AVAIL_GB=$(( $(grep MemAvailable /proc/meminfo | awk '{print $2}') / 1048576 ))
+ [ "$AVAIL_GB" -ge 100 ] || { echo "MemAvailable ${AVAIL_GB} GiB < 100 GiB, refusing to boot" >&2; exit 4; }
+ 
+-if [ "$EAGER" = "1" ]; then GRAPH_ARGS="--enforce-eager"; else GRAPH_ARGS="--compilation-config {\"cudagraph_mode\":\"$CUDAGRAPH_MODE\"}"; fi
+-if [ "$EAGER" = "1" ]; then SPEC_ADAPT=false; else SPEC_ADAPT="${SPEC_ADAPT:-true}"; fi  # adaptive verification needs CUDA graphs
++GRAPH_ENV=""
++if [ "$EAGER" = "1" ]; then
++  GRAPH_ARGS=(--enforce-eager)
++else
++  if [ "$ENGRAM_DISK" = "1" ] && ! grep -q '^model_state.py ' "$PATCH_DIR/mounts.txt"; then
++    echo "EAGER=0 + ENGRAM_DISK=1 needs the Engram prestage patch (model_state.py in mounts.txt)" >&2; exit 3
++  fi
++  if [ -z "$CG_SIZES" ]; then
++    if [ "$SPEC" = "dspark" ]; then
++      K="${SPEC_K:-5}"   # target decode = k+1 tokens/req, DSpark draft = k tokens/req
++      CG_SIZES=$( { seq "$K" "$K" $((K * SEQS)); seq $((K + 1)) $((K + 1)) $(((K + 1) * SEQS)); } | sort -n -u | paste -sd, - )
++    else
++      CG_SIZES=$(seq 1 "$SEQS" | paste -sd, -)
++    fi
++  fi
++  # Array: the JSON holds '[' ']' and must not be word-split or globbed.
++  GRAPH_ARGS=(--compilation-config "{\"cudagraph_mode\":\"$CUDAGRAPH_MODE\",\"cudagraph_capture_sizes\":[$CG_SIZES]}")
++  # Explicit on every node: eager_break_during_capture binds at model import.
++  GRAPH_ENV="-e VLLM_USE_BREAKABLE_CUDAGRAPH=1"
++fi
++# Adaptive verification needs CUDA graphs AND forces varlen FULL decode graphs
++# (model_runner.py:640) = padded rows on SM12x sparse MLA (FlashInfer #5015): opt-in.
++if [ "$EAGER" = "1" ]; then SPEC_ADAPT=false; else SPEC_ADAPT="${SPEC_ADAPT:-false}"; fi
+ if [ "$SPEC" = "dspark" ]; then
+   SPEC_ARGS="--speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_K:-5},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":${SPEC_ADAPT}}"
+ else SPEC_ARGS=""; fi
+@@ -103,7 +129,7 @@
+   -e VLLM_CACHE_ROOT="/cache/vllm-$EXP_NAME" \
+   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+   -e VLLM_USE_RUST_FRONTEND=$RUST_FE -e VLLM_HAS_FLASHINFER_CUBIN=1 \
+-  $ENGRAM_ENV \
++  $ENGRAM_ENV $GRAPH_ENV \
+   -e TORCH_CUDA_ARCH_LIST=12.1a -e FLASHINFER_CUDA_ARCH_LIST=12.1a -e FLASHINFER_DISABLE_VERSION_CHECK=1 \
+   -e NCCL_NET=IB -e NCCL_IB_DISABLE=0 -e NCCL_IB_HCA=rocep1s0f0 -e NCCL_IB_GID_INDEX=3 \
+   -e NCCL_IB_ROCE_VERSION_NUM=2 -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_ADDR_RANGE=192.168.192.0/24 \
+@@ -119,10 +145,10 @@
+     --max-num-seqs "$SEQS" --max-num-batched-tokens "$MAX_BATCHED" \
+     --engram-config '{"cpu_offload": false}' \
+     --default-chat-template-kwargs "{\"thinking\": $THINKING}" \
+-    $TEXT_ARGS $PARSER_ARGS $SPEC_ARGS $GRAPH_ARGS \
++    $TEXT_ARGS $PARSER_ARGS $SPEC_ARGS "${GRAPH_ARGS[@]}" \
+     --distributed-executor-backend mp --nnodes 4 --node-rank "$NODE_RANK" \
+     --master-addr "$HEAD_IP" --master-port "$MPORT" $HEADLESS $VLLM_EXTRA
+ 
+-echo "launched $NAME rank=$NODE_RANK exp=$EXP_NAME image=$IMAGE patches=$PATCH_DIR gmu=$GMU maxlen=$MAXLEN seqs=$SEQS eager=$EAGER spec=$SPEC engram_disk=$ENGRAM_DISK text_only=$TEXT_ONLY avail=${AVAIL_GB}GiB"
++echo "launched $NAME rank=$NODE_RANK exp=$EXP_NAME image=$IMAGE patches=$PATCH_DIR gmu=$GMU maxlen=$MAXLEN seqs=$SEQS eager=$EAGER cg=${CUDAGRAPH_MODE}[${CG_SIZES}] spec=$SPEC adapt=$SPEC_ADAPT engram_disk=$ENGRAM_DISK text_only=$TEXT_ONLY avail=${AVAIL_GB}GiB"
+ sleep 3
+ docker ps --format '{{.Names}} {{.Status}}' | grep "$NAME" || { echo "$NAME exited" >&2; docker logs --tail 40 "$NAME" >&2; exit 1; }

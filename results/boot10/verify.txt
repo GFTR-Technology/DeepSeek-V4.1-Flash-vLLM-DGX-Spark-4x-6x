@@ -1,0 +1,6 @@
+count run1: 200 tok / 2.36s = 84.9 tok/s | correct 1..100: True
+count run2: 200 tok / 2.38s = 84.0 tok/s | correct 1..100: True
+code run1 (bench v1 coding prompt, non-streaming): 200 tok / 3.06s = 65.3 tok/s
+code run2 (bench v1 coding prompt, non-streaming): 200 tok / 3.40s = 58.8 tok/s
+tool call: finish_reason=tool_calls tool_calls=[('get_weather', '{"city": "Paris", "unit": "c"}')] content="I'll check the current weather in Paris for you.\n\n" (2.2s)
+vision: answer='Red' prompt_tokens=201 (0.8s)

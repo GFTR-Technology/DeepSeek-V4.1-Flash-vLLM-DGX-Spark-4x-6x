@@ -1,0 +1,557 @@
+"""TP padding for DeepSeek-V4.1-Flash: pad the model up to the node count.
+
+TP is the node count. Four Sparks divide this checkpoint; six do not, and vLLM
+asserts inside ``divide()`` before the first forward. Rather than dropping to a
+smaller TP, the dimensions are padded UP and the padded slices are filled with
+zeros, which are arithmetically inert.
+
+Two halves, and they have to agree:
+
+* ``make_overlay.py`` writes a ``config.json`` carrying the padded dims into a
+  symlink overlay of the model directory, so vLLM BUILDS every layer padded.
+* this module hooks the weight loader and pads each checkpoint tensor as it
+  streams in, so the weights MATCH what was built.
+
+Unlike the GLM shim this one does not hard-code the checkpoint's dimensions:
+DeepSeek-V4.1-Flash ships them in ``config.json`` and they are read from there,
+then validated. Hard-coded constants would be a lie the first time the card is
+re-uploaded.
+
+Why zero padding is exact, per group:
+
+``attn``   ``wo_a`` is a batched matmul over ``o_groups``, each group consuming
+           exactly ``num_attention_heads / o_groups`` heads. That ratio is
+           structural, so padding adds WHOLE GROUPS, each carrying its full set
+           of dummy heads::
+
+               groups' = round_up(o_groups, tp)
+               heads'  = groups' * (heads / groups)
+
+           ``groups'`` is a multiple of tp, so ``heads'`` is too, for free. With
+           one group per head that is 64 heads -> 66 at TP=6. A dummy head's
+           ``wq_b`` rows are zero so its q is zero; whatever it attends to is
+           multiplied by its group's zero ``wo_a`` rows. Its ``attn_sink`` is
+           ``-inf``. A dummy group's ``wo_a`` rows are zero, and ``wo_b``'s
+           columns for it are zero.
+``moe``    ``gate_proj``/``up_proj`` rows and ``down_proj`` columns are zero, so
+           ``act(0)*0 = 0``. Rounded to ``tp * block`` so every rank still owns
+           whole blockwise-FP8 blocks.
+``dense``  same, for the dense FFN of the first layers.
+
+Engram is deliberately absent from the groups. Its tables are split by hash
+column and ``ParallelEngramEmbedding.forward`` already all-gathers every rank's
+columns and slices back to ``n_hash_cols``, so a rank past the last column simply
+owns nothing and its zeros are dropped. ``patch/engram.py`` carries the two
+clamps that stop such a rank from building a negative-width buffer or reading off
+the end of the table. Padding it would be wrong: the rows are primes generated
+from ``engram_vocab_size`` and a synthetic column has no rows on disk.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import sys
+from dataclasses import dataclass
+from typing import Callable, Iterable
+
+LOG_PREFIX = "[dsv41-tp-pad]"
+
+# Blockwise FP8/MXFP8 scale granularity. A block-quantized weight [N, K] carries
+# a scale of [N/block, K/block]; pad N off a block boundary and that scale has a
+# fractional number of rows, which cannot be expressed at all.
+DEFAULT_BLOCK = 128
+
+ALL_GROUPS = ("attn", "moe", "dense")
+DEFAULT_GROUPS = ("attn", "moe", "dense")
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
+
+
+# ---------------------------------------------------------------------------
+# Dimensions, read from the checkpoint
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Dims:
+    """The TP-sensitive extents, as the checkpoint ships them."""
+
+    heads: int
+    groups: int
+    head_dim: int
+    o_lora_rank: int
+    moe_intermediate: int
+    intermediate: int
+    block: int
+
+    @property
+    def heads_per_group(self) -> int:
+        return self.heads // self.groups
+
+
+def _flatten(raw: dict) -> dict:
+    flat = {}
+    for key in ("text_config", "language_config", "llm_config"):
+        sub = raw.get(key)
+        if isinstance(sub, dict):
+            flat.update(sub)
+    flat.update({k: v for k, v in raw.items() if not isinstance(v, dict)})
+    return flat
+
+
+def _quant_block(raw: dict) -> int:
+    q = raw.get("quantization_config")
+    sizes = []
+    if isinstance(q, dict):
+        for key in ("weight_block_size", "block_size", "group_size"):
+            v = q.get(key)
+            if isinstance(v, int) and v > 1:
+                sizes.append(v)
+            elif isinstance(v, (list, tuple)):
+                sizes += [x for x in v if isinstance(x, int) and x > 1]
+    # The coarsest block wins: a multiple of 128 is also a multiple of 64 and 32.
+    return max(sizes) if sizes else DEFAULT_BLOCK
+
+
+def load_dims(model_dir: str) -> Dims:
+    path = os.path.join(model_dir, "config.json")
+    with open(path, "r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    cfg = _flatten(raw)
+
+    def need(key: str) -> int:
+        v = cfg.get(key)
+        if not isinstance(v, int) or v <= 0:
+            raise SystemExit(
+                f"{LOG_PREFIX} {path}: {key} is {v!r}, expected a positive int. "
+                "The checkpoint changed shape; re-read this module before padding."
+            )
+        return v
+
+    heads = need("num_attention_heads")
+    groups = need("o_groups")
+    if heads % groups:
+        raise SystemExit(
+            f"{LOG_PREFIX} num_attention_heads={heads} is not a whole number of "
+            f"heads per o_groups={groups}. wo_a's per-group input would not be an "
+            "integer; refusing to guess a padding."
+        )
+    return Dims(
+        heads=heads,
+        groups=groups,
+        head_dim=need("head_dim"),
+        o_lora_rank=need("o_lora_rank"),
+        moe_intermediate=need("moe_intermediate_size"),
+        intermediate=need("intermediate_size"),
+        block=_quant_block(raw),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plan
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PadPlan:
+    """Target extents for one tensor parallel size."""
+
+    tp: int
+    groups: frozenset
+    dims: Dims
+    heads: int
+    o_groups: int
+    moe_intermediate: int
+    intermediate: int
+
+    @property
+    def active(self) -> bool:
+        d = self.dims
+        return (
+            self.heads != d.heads
+            or self.o_groups != d.groups
+            or self.moe_intermediate != d.moe_intermediate
+            or self.intermediate != d.intermediate
+        )
+
+    def summary(self) -> str:
+        d = self.dims
+        bits = []
+        if self.o_groups != d.groups:
+            bits.append(f"o_groups {d.groups}->{self.o_groups}")
+        if self.heads != d.heads:
+            bits.append(f"attention heads {d.heads}->{self.heads}")
+        if self.intermediate != d.intermediate:
+            bits.append(f"dense intermediate {d.intermediate}->{self.intermediate}")
+        if self.moe_intermediate != d.moe_intermediate:
+            bits.append(
+                f"moe intermediate {d.moe_intermediate}->{self.moe_intermediate}"
+            )
+        return ", ".join(bits) if bits else "nothing to pad"
+
+
+def plan_for_tp(dims: Dims, tp: int, groups: Iterable[str] | None = None) -> PadPlan:
+    """Compute the padded extents for ``tp`` ranks."""
+    if tp < 1:
+        raise ValueError(f"tp must be >= 1, got {tp}")
+    selected = frozenset(DEFAULT_GROUPS if groups is None else groups)
+    unknown = selected - frozenset(ALL_GROUPS)
+    if unknown:
+        raise ValueError(f"unknown pad groups: {sorted(unknown)}")
+
+    if "attn" in selected:
+        o_groups = _round_up(dims.groups, tp)
+        heads = o_groups * dims.heads_per_group
+    else:
+        o_groups, heads = dims.groups, dims.heads
+
+    plan = PadPlan(
+        tp=tp,
+        groups=selected,
+        dims=dims,
+        heads=heads,
+        o_groups=o_groups,
+        moe_intermediate=(
+            _round_up(dims.moe_intermediate, tp * dims.block)
+            if "moe" in selected and dims.moe_intermediate % tp
+            else dims.moe_intermediate
+        ),
+        intermediate=(
+            _round_up(dims.intermediate, tp * dims.block)
+            if "dense" in selected and dims.intermediate % tp
+            else dims.intermediate
+        ),
+    )
+    _validate(plan)
+    return plan
+
+
+def _validate(plan: PadPlan) -> None:
+    """Check the extents this plan is responsible for.
+
+    Only enabled groups are checked. Switching a group off is an explicit claim
+    that the dimension is not TP-sharded in this build, so demanding
+    divisibility there would be wrong.
+    """
+    tp, d = plan.tp, plan.dims
+    checks = [
+        ("attn", "attention heads", plan.heads),
+        ("attn", "o_groups", plan.o_groups),
+        ("attn", "wq_b out", plan.heads * d.head_dim),
+        ("attn", "wo_a out", plan.o_groups * d.o_lora_rank),
+        ("moe", "moe intermediate", plan.moe_intermediate),
+        ("dense", "dense intermediate", plan.intermediate),
+    ]
+    for group, what, size in checks:
+        if group in plan.groups and size % tp:
+            raise AssertionError(f"{what}={size} is not divisible by tp={tp}")
+
+    if "attn" in plan.groups and plan.heads % plan.o_groups:
+        raise AssertionError(
+            f"padded heads={plan.heads} is not a whole number of heads per "
+            f"padded o_groups={plan.o_groups}; wo_a's bmm would be re-cut"
+        )
+
+    # Blockwise-quantized shards must stay whole blocks on every rank.
+    for group, what, size in (
+        ("attn", "wq_b out", plan.heads * d.head_dim),
+        ("attn", "wo_a out", plan.o_groups * d.o_lora_rank),
+        ("moe", "moe intermediate", plan.moe_intermediate),
+        ("dense", "dense intermediate", plan.intermediate),
+    ):
+        if group not in plan.groups:
+            continue
+        per_rank = size // tp
+        if per_rank % d.block:
+            raise AssertionError(
+                f"{what} per rank = {per_rank} is not a multiple of {d.block}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
+
+ZERO = "zero"
+NEG_INF = "neg_inf"
+
+
+@dataclass(frozen=True)
+class Rule:
+    group: str
+    what: str
+    pattern: "re.Pattern"
+    dim: int
+    old: int
+    new: int
+    mode: str = ZERO
+
+
+def _rx(tail: str) -> "re.Pattern":
+    """Match a MODULE suffix, whatever parameter hangs off it.
+
+    Keying on the module rather than the parameter is what keeps a weight and its
+    blockwise scale consistent: `.wq_b` covers `.wq_b.weight` and
+    `.wq_b.weight_scale_inv` together.
+    """
+    return re.compile(
+        r"(^|\.)" + re.escape(tail.lstrip(".")) +
+        r"(\.(weight|weight_scale_inv|weight_scale|weight_packed|scales|scale|qweight|bias))?$"
+    )
+
+
+def build_rules(plan: PadPlan) -> list[Rule]:
+    d = plan.dims
+    rules: list[Rule] = []
+
+    def rule(group, what, tail, dim, old, new, mode=ZERO):
+        if old == new:
+            return
+        if new < old:
+            raise AssertionError(f"{what}: rule would shrink {old} -> {new}")
+        rules.append(Rule(group, what, _rx(tail), dim, old, new, mode))
+
+    if "attn" in plan.groups:
+        rule("attn", "wq_b out", ".wq_b", 0, d.heads * d.head_dim, plan.heads * d.head_dim)
+        rule("attn", "attn sink", ".attn_sink", 0, d.heads, plan.heads, NEG_INF)
+        rule("attn", "wo_a out", ".wo_a", 0,
+             d.groups * d.o_lora_rank, plan.o_groups * d.o_lora_rank)
+        rule("attn", "wo_b in", ".wo_b", 1,
+             d.groups * d.o_lora_rank, plan.o_groups * d.o_lora_rank)
+        # wo_a's per-group input is heads*head_dim/groups. Heads and groups grow
+        # by the same factor, so it does not move and needs no rule.
+    for tail in (".gate_proj", ".up_proj", ".w1", ".w3"):
+        if "moe" in plan.groups:
+            rule("moe", f"moe {tail} out", tail, 0, d.moe_intermediate, plan.moe_intermediate)
+        if "dense" in plan.groups:
+            rule("dense", f"dense {tail} out", tail, 0, d.intermediate, plan.intermediate)
+    for tail in (".down_proj", ".w2"):
+        if "moe" in plan.groups:
+            rule("moe", f"moe {tail} in", tail, 1, d.moe_intermediate, plan.moe_intermediate)
+        if "dense" in plan.groups:
+            rule("dense", f"dense {tail} in", tail, 1, d.intermediate, plan.intermediate)
+    return rules
+
+
+# ---------------------------------------------------------------------------
+# Padding
+# ---------------------------------------------------------------------------
+
+MAX_QUANT_BLOCK = 256
+
+
+def pad_tensor(tensor, rule: Rule):
+    """Zero-pad ``tensor`` along ``rule.dim`` if it is the size the rule expects.
+
+    A blockwise scale tensor is an exact integer fraction of the weight's extent;
+    the block is inferred from that ratio so scales need no rules of their own.
+    Returns the tensor unchanged when the rule does not apply.
+    """
+    import torch
+
+    dim = rule.dim
+    if dim >= tensor.dim():
+        return tensor
+    have, src, dst = tensor.shape[dim], rule.old, rule.new
+    if have == src:
+        block = 1
+    elif (
+        1 < have < src
+        and src % have == 0
+        and src // have <= MAX_QUANT_BLOCK
+        and dst % (src // have) == 0
+    ):
+        block = src // have
+    else:
+        # not this dimension, already padded, or a per-tensor scale (never grows)
+        return tensor
+    want = dst // block
+    if want == have:
+        return tensor
+    shape = list(tensor.shape)
+    shape[dim] = want - have
+    fill = float("-inf") if rule.mode is NEG_INF else 0.0
+    tail = torch.full(shape, fill, dtype=tensor.dtype, device=tensor.device)
+    return torch.cat([tensor, tail], dim=dim)
+
+
+class Padder:
+    """Applies the plan to a stream of (name, tensor) pairs."""
+
+    def __init__(self, plan: PadPlan):
+        self.plan = plan
+        self.rules = build_rules(plan)
+        self.count = 0
+        self.by_rule: dict[str, int] = {}
+
+    def __call__(self, name: str, tensor):
+        for rule in self.rules:
+            if not rule.pattern.search(name):
+                continue
+            padded = pad_tensor(tensor, rule)
+            if padded is tensor:
+                continue
+            self.count += 1
+            self.by_rule[rule.what] = self.by_rule.get(rule.what, 0) + 1
+            if _debug() or self.count <= 8:
+                _log(f"{name} dim{rule.dim} {tensor.shape[rule.dim]} -> "
+                     f"{padded.shape[rule.dim]} [{rule.what}]")
+            tensor = padded
+        return tensor
+
+    def report(self) -> str:
+        if not self.count:
+            return "padded nothing (no tensor matched a rule)"
+        parts = ", ".join(f"{k} x{v}" for k, v in sorted(self.by_rule.items()))
+        return f"padded {self.count} tensor(s): {parts}"
+
+
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
+
+
+def _log(message: str) -> None:
+    print(f"{LOG_PREFIX} {message}", file=sys.stderr, flush=True)
+
+
+def _debug() -> bool:
+    return os.environ.get("DSV41_TP_PAD_DEBUG", "").strip() not in ("", "0")
+
+
+_PLAN: PadPlan | None = None
+_PADDER: Padder | None = None
+_PATCHED: set = set()
+
+
+def _env_plan() -> PadPlan | None:
+    """The plan this container was launched with, from the environment."""
+    global _PLAN
+    if _PLAN is not None:
+        return _PLAN
+    raw_tp = os.environ.get("DSV41_TP_PAD", "").strip()
+    if raw_tp in ("", "0", "1"):
+        return None
+    src = os.environ.get("DSV41_MODEL_SRC", "/model")
+    groups_env = os.environ.get("DSV41_TP_PAD_GROUPS", "").strip()
+    groups = [g.strip() for g in groups_env.split(",") if g.strip()] or None
+    _PLAN = plan_for_tp(load_dims(src), int(raw_tp), groups)
+    return _PLAN
+
+
+def _padder() -> Padder | None:
+    global _PADDER
+    if _PADDER is None:
+        plan = _env_plan()
+        if plan is None or not plan.active:
+            return None
+        _PADDER = Padder(plan)
+        _log(f"TP={plan.tp}: {plan.summary()}")
+    return _PADDER
+
+
+def patch_weight_loader(module) -> bool:
+    """Wrap the weight iterators so every tensor is padded before vLLM shards it.
+
+    The seam is the generator that yields (name, tensor): whatever narrows the
+    tensor for this rank runs after it, on the padded extent.
+    """
+    padder = _padder()
+    if padder is None:
+        return False
+    key = getattr(module, "__name__", str(module))
+    if key in _PATCHED:
+        return True
+    wrapped = 0
+    for attr in dir(module):
+        if not attr.endswith("_weights_iterator"):
+            continue
+        original = getattr(module, attr, None)
+        if not callable(original):
+            continue
+
+        def make(original=original):
+            def gen(*args, **kwargs):
+                for name, tensor in original(*args, **kwargs):
+                    yield name, padder(name, tensor)
+            return gen
+
+        setattr(module, attr, make())
+        wrapped += 1
+    if wrapped:
+        _PATCHED.add(key)
+        _log(f"wrapped {wrapped} weight iterator(s) in {key}")
+    return bool(wrapped)
+
+
+HOOKS: dict[str, Callable] = {
+    "vllm.model_executor.model_loader.weight_utils": patch_weight_loader,
+    "vllm.model_executor.model_loader.default_loader": patch_weight_loader,
+    # older layouts kept the loaders in one module
+    "vllm.model_executor.model_loader.loader": patch_weight_loader,
+}
+
+
+def install() -> bool:
+    """Patch whatever vLLM modules are already imported. Idempotent."""
+    ok = False
+    for name, fn in HOOKS.items():
+        module = sys.modules.get(name)
+        if module is not None:
+            ok = fn(module) or ok
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# CLI — so the launch scripts and the container share one plan implementation
+# instead of re-deriving 66 / 2304 in bash.
+# ---------------------------------------------------------------------------
+
+
+def _main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DeepSeek-V4.1-Flash TP padding plan")
+    parser.add_argument("--tp", type=int, required=True)
+    parser.add_argument("--model", default=os.environ.get("DSV41_MODEL_SRC", "/model"),
+                        help="model directory holding config.json")
+    parser.add_argument("--groups", default="")
+    parser.add_argument("--shell", action="store_true",
+                        help="emit eval-able shell assignments instead of prose")
+    args = parser.parse_args(argv)
+
+    groups = [g.strip() for g in args.groups.split(",") if g.strip()] or None
+    plan = plan_for_tp(load_dims(args.model), args.tp, groups)
+
+    if args.shell:
+        import shlex
+
+        print(f"DSV41_PAD_ACTIVE={1 if plan.active else 0}")
+        print(f"DSV41_PAD_SUMMARY={shlex.quote(plan.summary())}")
+        print(f"DSV41_PAD_GROUPS={shlex.quote(','.join(sorted(plan.groups)))}")
+        print(f"DSV41_PAD_HEADS={plan.heads}")
+        print(f"DSV41_PAD_O_GROUPS={plan.o_groups}")
+        print(f"DSV41_PAD_MOE_INTERMEDIATE={plan.moe_intermediate}")
+        print(f"DSV41_PAD_INTERMEDIATE={plan.intermediate}")
+        return 0
+
+    d = plan.dims
+    print(f"TP={plan.tp} active={plan.active} groups={','.join(sorted(plan.groups))}")
+    print(f"  checkpoint: heads={d.heads} o_groups={d.groups} "
+          f"head_dim={d.head_dim} o_lora_rank={d.o_lora_rank} "
+          f"moe_intermediate={d.moe_intermediate} intermediate={d.intermediate} "
+          f"quant block={d.block}")
+    print(f"  {plan.summary()}")
+    for rule in build_rules(plan):
+        print(f"  {rule.group:6s} {rule.what:22s} dim{rule.dim} "
+              f"{rule.old} -> {rule.new}  [{rule.mode}]")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

@@ -1,0 +1,44 @@
+--- a/vllm/model_executor/models/deepseek_v4_1/common/engram.py
++++ b/vllm/model_executor/models/deepseek_v4_1/common/engram.py
+@@ -807,6 +807,14 @@
+     reads of every table go out in ONE parallel batch. Same math as before."""
+     plans, jobs = [], []
+     for table, rel, owned in requests:
++        # Tech2Wild/Kai 2026-09-11 (TP alignment): under a TP that does not
++        # divide n_hash_cols, the last rank(s) own no columns and therefore no
++        # rows. Their row_start sits at the very end of the table, so even the
++        # de-duplicated single read would run off it. Nothing is owned, so the
++        # answer is all zeros: skip the read entirely.
++        if not bool(owned.any()):
++            plans.append((table, None, None, None, owned))
++            continue
+         uniq, inverse = torch.unique(rel, return_inverse=True)
+         w = torch.empty((uniq.numel(), table.dim), dtype=torch.uint8)
+         s = torch.empty((uniq.numel(), table.sb), dtype=torch.uint8)
+@@ -815,6 +823,9 @@
+     _kai_parallel_read(jobs)
+     outs = []
+     for table, w, s, inverse, owned in plans:
++        if w is None:
++            outs.append(torch.zeros((owned.numel(), table.dim), dtype=torch.bfloat16))
++            continue
+         out = table.dequant(w, s)[inverse]
+         out[~owned] = 0
+         outs.append(out.to(torch.bfloat16))
+@@ -1331,7 +1342,15 @@
+         emb = self.engrams[0].embed_tokens
+         self.local_heads = emb.part_n_hash_cols
+         self.head_start = emb.head_start
+-        self.head_end = min(emb.head_start + emb.part_n_hash_cols, emb.n_hash_cols)
++        # Tech2Wild/Kai 2026-09-11 (TP alignment): the columns are split
++        # ceil(n_hash_cols / tp_size) per rank, so a TP that does not divide the
++        # column count leaves the last rank(s) past the end -- head_start can
++        # exceed n_hash_cols and this width would go NEGATIVE. Clamp it to zero:
++        # such a rank stages nothing, its rows stay zero, and the forward's
++        # all-gather + slice back to n_hash_cols drops them anyway. That is what
++        # makes TP=6 (and any other non-dividing TP) work without padding Engram.
++        self.head_end = max(self.head_start,
++                            min(emb.head_start + emb.part_n_hash_cols, emb.n_hash_cols))
+         self.dim = emb.dim
+         self.max_tokens = self.engrams[0].staged_rows.shape[0]
+         num_layers = hash_state.multipliers.shape[0]
