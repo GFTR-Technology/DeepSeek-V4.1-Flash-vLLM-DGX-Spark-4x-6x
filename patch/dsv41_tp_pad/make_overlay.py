@@ -3,7 +3,7 @@
 vLLM derives every parallel layer's shape from the config, so the config has to
 agree with what `dsv41_tp_pad` does to the weight stream. Rather than
 monkeypatching the config classes, we hand vLLM a directory that symlinks the 48
-real shards (zero copy, no extra disk) and carries one rewritten file.
+real shards (zero copy, no extra disk) and carries one rewritten file..
 
     python3 /opt/dsv41/make_overlay.py --src /model --dst /model-tp6 --tp 6
 

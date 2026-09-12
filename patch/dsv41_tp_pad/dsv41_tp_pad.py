@@ -64,8 +64,13 @@ LOG_PREFIX = "[dsv41-tp-pad]"
 # fractional number of rows, which cannot be expressed at all.
 DEFAULT_BLOCK = 128
 
-ALL_GROUPS = ("attn", "moe", "dense")
-DEFAULT_GROUPS = ("attn", "moe", "dense")
+ALL_GROUPS = ("attn", "moe", "dense", "vocab")
+DEFAULT_GROUPS = ("attn", "moe", "dense", "vocab")
+
+# vLLM already rounds the vocab up to a multiple of this before sharding it
+# (DEFAULT_VOCAB_PADDING_SIZE). The real value is read from the module at
+# patch time; this is only the plan-side default.
+VOCAB_PAD_BASE = 64
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -93,6 +98,7 @@ class Dims:
     o_lora_rank: "int | None" = None
     moe_intermediate: "int | None" = None
     intermediate: "int | None" = None
+    vocab_size: "int | None" = None
     block: int = DEFAULT_BLOCK
 
     @property
@@ -152,6 +158,7 @@ def load_dims(model_dir: str) -> Dims:
         o_lora_rank=opt("o_lora_rank"),
         moe_intermediate=opt("moe_intermediate_size"),
         intermediate=opt("intermediate_size"),
+        vocab_size=opt("vocab_size"),
         block=_quant_block(raw),
     )
 
@@ -172,6 +179,14 @@ class PadPlan:
     o_groups: int
     moe_intermediate: int
     intermediate: int
+    vocab_pad_to: int = VOCAB_PAD_BASE
+
+    @property
+    def vocab_padded(self) -> "int | None":
+        """What vLLM will round the vocab up to under this plan."""
+        if not self.dims.vocab_size:
+            return None
+        return _round_up(self.dims.vocab_size, self.vocab_pad_to)
 
     @property
     def active(self) -> bool:
@@ -181,6 +196,8 @@ class PadPlan:
             or (self.o_groups or 0) != (d.groups or 0)
             or self.moe_intermediate != d.moe_intermediate
             or self.intermediate != d.intermediate
+            or (self.vocab_padded is not None
+                and self.vocab_padded != _round_up(d.vocab_size, VOCAB_PAD_BASE))
         )
 
     def summary(self) -> str:
@@ -196,6 +213,9 @@ class PadPlan:
             bits.append(
                 f"moe intermediate {d.moe_intermediate}->{self.moe_intermediate}"
             )
+        vp = self.vocab_padded
+        if vp is not None and vp != _round_up(d.vocab_size, VOCAB_PAD_BASE):
+            bits.append(f"vocab {_round_up(d.vocab_size, VOCAB_PAD_BASE)}->{vp}")
         return ", ".join(bits) if bits else "nothing to pad"
 
 
@@ -237,6 +257,10 @@ def plan_for_tp(dims: Dims, tp: int, groups: Iterable[str] | None = None) -> Pad
             if "dense" in selected and dims.intermediate and dims.intermediate % tp
             else dims.intermediate
         ),
+        # The embedding is sharded AFTER vLLM rounds the vocab up, so that
+        # rounding has to land on a multiple of tp as well.
+        vocab_pad_to=(math.lcm(VOCAB_PAD_BASE, tp) if "vocab" in selected
+                      else VOCAB_PAD_BASE),
     )
     _validate(plan)
     return plan
@@ -258,6 +282,7 @@ def _validate(plan: PadPlan) -> None:
          plan.o_groups * d.o_lora_rank if plan.o_groups and d.o_lora_rank else None),
         ("moe", "moe intermediate", plan.moe_intermediate),
         ("dense", "dense intermediate", plan.intermediate),
+        ("vocab", "padded vocab", plan.vocab_padded),
     ]
     for group, what, size in checks:
         if group in plan.groups and size and size % tp:
@@ -518,7 +543,44 @@ def patch_weight_loader(module) -> bool:
     return bool(wrapped)
 
 
+def patch_vocab_padding(module) -> bool:
+    """Round the vocab up to a multiple of tp as well as of the default unit.
+
+    vLLM shards the embedding over tp AFTER padding the vocab with
+    ``pad_vocab_size`` (default unit 64). 129280 is a whole number of 64s but not
+    of 6, so ``divide(129280, 6)`` asserts. Rounding to ``lcm(64, tp)`` instead
+    satisfies both.
+
+    No weight rule goes with this: vLLM builds the embedding at the padded size
+    and its loader fills only the real rows, and the logits processor slices back
+    to ``org_vocab_size``, so the extra rows can never be sampled.
+    """
+    plan = _env_plan()
+    if plan is None or "vocab" not in plan.groups:
+        return False
+    key = getattr(module, "__name__", str(module))
+    if key in _PATCHED:
+        return True
+    original = getattr(module, "pad_vocab_size", None)
+    if not callable(original):
+        return False
+    base = getattr(module, "DEFAULT_VOCAB_PADDING_SIZE", VOCAB_PAD_BASE)
+    tp = plan.tp
+
+    def pad_vocab_size(vocab_size, pad_to=base, **kwargs):
+        want = math.lcm(pad_to or base, tp)
+        return -(-vocab_size // want) * want
+
+    module.pad_vocab_size = pad_vocab_size
+    module.DEFAULT_VOCAB_PADDING_SIZE = math.lcm(base, tp)
+    _PATCHED.add(key)
+    _log(f"vocab padding unit {base} -> {math.lcm(base, tp)} so the padded vocab "
+         f"divides tp={tp}")
+    return True
+
+
 HOOKS: dict[str, Callable] = {
+    "vllm.model_executor.layers.vocab_parallel_embedding": patch_vocab_padding,
     "vllm.model_executor.model_loader.weight_utils": patch_weight_loader,
     "vllm.model_executor.model_loader.default_loader": patch_weight_loader,
     # older layouts kept the loaders in one module
@@ -572,6 +634,7 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"DSV41_PAD_O_GROUPS={sh(plan.o_groups)}")
         print(f"DSV41_PAD_MOE_INTERMEDIATE={sh(plan.moe_intermediate)}")
         print(f"DSV41_PAD_INTERMEDIATE={sh(plan.intermediate)}")
+        print(f"DSV41_PAD_VOCAB={sh(plan.vocab_padded)}")
         return 0
 
     d = plan.dims
@@ -579,8 +642,9 @@ def _main(argv: list[str] | None = None) -> int:
     print(f"  checkpoint: heads={d.heads} o_groups={d.groups} "
           f"head_dim={d.head_dim} o_lora_rank={d.o_lora_rank} "
           f"moe_intermediate={d.moe_intermediate} intermediate={d.intermediate} "
-          f"quant block={d.block}")
+          f"vocab={d.vocab_size} quant block={d.block}")
     missing = [k for k, v in (("o_groups", d.groups), ("head_dim", d.head_dim),
+                              ("vocab_size", d.vocab_size),
                               ("o_lora_rank", d.o_lora_rank),
                               ("moe_intermediate_size", d.moe_intermediate),
                               ("intermediate_size", d.intermediate)) if v is None]

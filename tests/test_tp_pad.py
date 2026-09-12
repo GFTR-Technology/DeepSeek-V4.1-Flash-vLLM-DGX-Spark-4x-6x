@@ -34,6 +34,7 @@ SOLO = {
     "num_attention_heads": 64, "o_groups": 64, "head_dim": 128,
     "o_lora_rank": 512, "intermediate_size": 18432, "moe_intermediate_size": 2048,
     "num_key_value_heads": 1,   # MLA: one latent KV head, must survive padding
+    "vocab_size": 129280,       # 64 x 2020: padded for 64, not for 6
     "quantization_config": {"weight_block_size": [128, 128]},
 }
 # Four groups of 16 heads: padding has to add whole groups.
@@ -136,6 +137,44 @@ def test_plan(m):
             check("no heads refused", "no error", "SystemExit")
         except SystemExit:
             check("no heads refused", True, True)
+
+    print("plan: vocab is rounded to lcm(64, tp), not padded as a weight")
+    pv = m.plan_for_tp(d, 6)
+    check("129280 -> 129408", pv.vocab_padded, 129408)
+    check("divides tp", pv.vocab_padded % 6, 0)
+    check("still a whole number of 64s", pv.vocab_padded % 64, 0)
+    check("TP=4 leaves it alone", m.plan_for_tp(d, 4).vocab_padded, 129280)
+    check("no weight rule for vocab",
+          any("vocab" in r.what for r in m.build_rules(pv)), False)
+    # TP=8: lcm(64,8) is 64, so the vocab needs nothing and neither does anything
+    # else here -> the plan must report itself inactive rather than invent work
+    d8 = m.Dims(heads=64, groups=8, head_dim=512, o_lora_rank=1024,
+                moe_intermediate=2304, vocab_size=129280, block=32)
+    check("TP=8 needs nothing at all", m.plan_for_tp(d8, 8).active, False)
+    # a TP where everything else divides but the vocab does not: 12 groups of 8
+    # heads at TP=6 -> heads 96, groups 12, moe 2304 all divide; vocab does not
+    d_vocab = m.Dims(heads=96, groups=12, head_dim=512, o_lora_rank=1024,
+                     moe_intermediate=2304, vocab_size=129280, block=32)
+    pvo = m.plan_for_tp(d_vocab, 6)
+    check("vocab alone makes the plan active", pvo.active, True)
+    check("and it is the only change", pvo.summary(), "vocab 129280->129408")
+
+    print("plan: the vocab hook rewrites pad_vocab_size")
+    import types
+    mod = types.SimpleNamespace(
+        __name__="vllm.model_executor.layers.vocab_parallel_embedding",
+        DEFAULT_VOCAB_PADDING_SIZE=64,
+        pad_vocab_size=lambda v, pad_to=64: -(-v // pad_to) * pad_to)
+    os.environ["DSV41_TP_PAD"] = "6"
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["DSV41_MODEL_SRC"] = write_model(tmp, SOLO)
+        m._PLAN = None; m._PADDER = None; m._PATCHED.clear()
+        check("hook applied", m.patch_vocab_padding(mod), True)
+        check("pad_vocab_size(129280) -> 129408", mod.pad_vocab_size(129280), 129408)
+        check("explicit pad_to=64 still lifted", mod.pad_vocab_size(129280, pad_to=64), 129408)
+        check("default unit updated", mod.DEFAULT_VOCAB_PADDING_SIZE, 192)
+    m._PLAN = None; m._PADDER = None; m._PATCHED.clear()
+    os.environ.pop("DSV41_TP_PAD", None); os.environ.pop("DSV41_MODEL_SRC", None)
 
     print("plan: groups can be switched off")
     check("attn only", m.plan_for_tp(d, 6, ["attn"]).moe_intermediate, 2048)

@@ -43,6 +43,7 @@ the first time the card is re-uploaded. Everything read is then validated, and
 | `attn` | `wo_a` rows for a dummy group | that group's `o_lora` latent is 0, and `wo_b`'s columns for it are 0 |
 | `attn` | `wq_b` rows, `attn_sink` for a dummy head | its q is 0, so it attends uniformly to something finite — which is then multiplied by its group's zero `wo_a` rows. Its sink is `-inf`, so it adds nothing to the softmax either. |
 | `moe` / `dense` | `gate_proj`/`up_proj` rows, `down_proj` columns | `act(0) * 0 = 0` |
+| `vocab` | extra embedding rows | no weight rule at all — see below |
 
 ## Two constraints the plan has to respect
 
@@ -77,6 +78,25 @@ Rules key on the **module** (`.wq_b`), not the parameter, so `.wq_b.weight` and
 `.wq_b.weight_scale_inv` are padded consistently; each scale's block is inferred
 from the ratio of its size to the weight's. A per-tensor `input_scale` (size 1)
 is never grown.
+
+## The vocab is rounded, not padded
+
+vLLM shards the embedding *after* rounding the vocab up with `pad_vocab_size`
+(default unit 64). This checkpoint's 129280 is a whole number of 64s but not of
+6, so `divide(129280, 6)` asserts inside `VocabParallelEmbedding`. The `vocab`
+group makes that rounding land on `lcm(64, tp)` instead — 192 at TP=6, giving
+129408, which is a whole number of both 6 and 64.
+
+No weight rule accompanies it, and none is wanted: vLLM already builds the
+embedding at the padded size and its loader fills only the real rows, leaving the
+rest zero. The logits processor slices back to `org_vocab_size`, so the extra 128
+rows can never be sampled. The hook therefore only rewrites `pad_vocab_size` in
+`vllm.model_executor.layers.vocab_parallel_embedding`, and `make_overlay.py`
+deliberately leaves `vocab_size` in the config alone — the checkpoint's embedding
+rows have not moved.
+
+`lcm(64, tp)` is 64 whenever tp divides 64, so at TP=4 or TP=8 this group is a
+no-op. That is why it never surfaced until TP=6.
 
 ## Engram is not padded
 

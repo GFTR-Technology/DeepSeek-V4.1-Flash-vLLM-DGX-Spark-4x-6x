@@ -302,6 +302,8 @@ CUDA graphs 是吞吐的关键：eager decode 在这个模型上是 host-bound �
 1. **头和组一起补，以组为准。** `wo_a` 是按 `o_groups` 做的批量矩阵乘（`is_bmm=True`），每组恰好吃 `heads/groups` 个头。这个比值是权重的结构，改了等于重新切分 checkpoint。所以按**整组**补，每组带上它那一整套虚拟头：`groups' = round_up(groups, tp)`，`heads' = groups' * heads_per_group`。`groups'` 是 tp 的倍数，`heads'` 自动也是。每组输入宽度始终不变，所以 `wo_a` 的第二维不需要任何规则。
 2. **量化轴必须保持整块。** 块量化权重 `[N,K]` 带 `[N/block,K/block]` 的 scale，N 补到非 block 整数倍时 scale 行数就成了小数——根本补不了。所以 FFN 宽度补到 `tp * block` 的倍数：2048 在 TP=6、block=128 时补到 **2304**（不是 2052）。头数/组数不需要这一步：它们进张量时乘了 `head_dim` / `o_lora_rank`，本身已经是 block 的倍数。
 
+**词表是改「取整单位」，不是补权重。** vLLM 先用 `pad_vocab_size`（默认单位 64）把词表向上取整，再按 TP 切分。这个 checkpoint 的 129280 是 64 的整数倍但不是 6 的倍数，于是在 `VocabParallelEmbedding` 里 `divide(129280, 6)` 断言失败。`vocab` 组把取整单位改成 `lcm(64, tp)`（TP=6 时是 192），得到 129408 —— 同时是 6 和 64 的整数倍。**不需要任何权重规则**：vLLM 本来就按补齐后的尺寸建 embedding，loader 只填真实行、其余留零，logits 又会切回 `org_vocab_size`，多出来的 128 行永远采样不到。TP 能整除 64 时（4、8）这一组自动无操作，所以之前一直没暴露。
+
 **Engram 不补齐。** 它按哈希列切，而 forward 本来就是「all-gather 之后切回 `n_hash_cols`」，所以除不尽时最后几个 rank 单纯什么都不持有、它们的 0 会被切掉。补齐反而是错的：行是从 `engram_vocab_size` 生成的素数，虚拟列在磁盘上没有行。只有两处原先假设这不会发生（stager 的缓冲区宽度会变成负数、空 rank 的去重读会越过表尾），已在 `patch/engram.py` 修掉，diff 见 `patch/dsv41_tp_pad/engram-uneven-tp.diff`。
 
 **第一次跑 TP≠4 之前：**
@@ -392,7 +394,7 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 | `DSV41_EXTRA` | — | 追加给 `vllm serve` 的参数 |
 | `DSV41_IMAGE` / `DSV41_NAME` / `DSV41_PORT` | 随 cluster.env | 临时换镜像/容器名/端口 |
 | `DSV41_SKIP_CLOCK_CHECK` | `0` | 跳过 GPU 时钟预检 |
-| `DSV41_TP_PAD_GROUPS` | `attn,dense,moe` | 只补其中某些组 |
+| `DSV41_TP_PAD_GROUPS` | `attn,dense,moe,vocab` | 只补其中某些组 |
 | `DSV41_TP_PAD_DEBUG` | — | 打印每一个被补齐的张量 |
 | `DSV41_INSTALL_NFS` | `1` | `fetch-weights.sh nfs` 自动安装缺失的 NFS 包；`0` 则只提示 |
 | `NFS_EXPORT_CLIENTS` | 自动探测 | 覆盖导出 ACL，例如 `10.10.0.0/16` 或空格分隔的地址列表（写在 `cluster.env` 里） |
@@ -417,6 +419,8 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 | `failed to compute checksum of ref ... "/vllm": not found` | overlay1 的构建上下文里没有 `build/vllm/`（dsv41-feat 的 Python 树）。跑 `./scripts/build-image.sh --check` 看完整清单 |
 | `exportfs：找不到命令` / `exportfs: command not found` | head 上没装 NFS 服务端。`sudo apt-get install -y nfs-kernel-server`，或直接重跑 `./scripts/fetch-weights.sh nfs`（新版会自己装；权重已下好会跳过下载） |
 | worker 挂载报 `wrong fs type` | worker 上没装 `nfs-common`，同样由 `fetch-weights.sh nfs` 自动处理 |
+| `AssertionError: 129280 is not divisible by 6` | 词表取整单位问题，见第 9 节的 `vocab` 组。确认各节点的 `patch/dsv41_tp_pad/` 已是最新 |
+| `Call to socket failed: Too many open files` | 容器 `nofile` 上限太低，启动器已设 `--ulimit nofile=65536`（`DSV41_NOFILE` 可调）。docker daemon 拒绝的话查 `systemctl show docker | grep -i limitnofile` |
 | `mount.nfs: access denied by server` | 导出 ACL 不含 worker 实际用的源地址（跨网段/多网卡时最常见）。worker 上 `ip route get <head>` 看 `src`，head 上 `sudo exportfs -v` 看导出给了谁；重跑 `./scripts/fetch-weights.sh nfs` 会按源地址自动重建 ACL |
 | 挂载成功但读文件 `Permission denied` | 导出路径某级父目录不是 `o+x`（`/root` 是 0700），`root_squash` 下读不了。把权重挪到 `/var/tmp/models` 并改 `cluster.env` 的 `WEIGHTS` |
 | worker 挂载超时 | 从 worker 上 `showmount -e <head>` 看导出；确认 head 放行 2049/tcp |
