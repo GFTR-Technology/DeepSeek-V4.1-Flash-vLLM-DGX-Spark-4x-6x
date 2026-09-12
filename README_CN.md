@@ -130,9 +130,28 @@ sudo apt-get install -y nfs-common          # 每个 worker
 镜像是**节点本地**的：要么每台都构建，要么在 head 构建后分发。
 
 ```bash
-./scripts/build-image.sh     # head 上构建整条 overlay 链，最终 tag 为 $IMAGE
-./scripts/copy-image.sh      # docker save + rsync + docker load 到每个 worker
+./scripts/build-image.sh --check   # 先看缺什么，不动手
+./scripts/build-image.sh           # 构建整条 overlay 链，最终 tag 为 $IMAGE
+./scripts/copy-image.sh            # docker save + rsync + docker load 到每个 worker
 ```
+
+> **这是整个仓库自动化程度最低的一步。** overlay3/4/5 是自洽的（所有 SHA 都钉死在
+> `build/build_overlay{3,4,5}.sh` 里），但 **overlay1 需要两样本仓库无法附带的东西**：
+>
+> 1. `build/vllm/` —— vllm-project/vllm 分支 `dsv41-feat` 的 Python 目录树，
+>    `Dockerfile.overlay` 会把它盖到基础镜像的 site-packages 上；
+> 2. 一个名为 `v41build`、`/src` 指向同一份 checkout 的运行中容器，
+>    `build/build_stable_ext.sh` 在里面为 sm_121a 重编 `_C_stable_libtorch`。
+>    分支的 kernel 改动全在这一个扩展里，官方 ARM64 wheel 不带 SM 12.1 的版本。
+>
+> `--check` 会逐项告诉你缺哪个、怎么补，而不是让 docker 在 `COPY vllm/` 上报一句
+> `"/vllm": not found`。补齐后可以用 `--from overlay3` 之类从中间续跑，不用从头再来。
+>
+> 想跳过 overlay1：`./scripts/build-image.sh --from-published` 会把官方 day-0 镜像
+> `vllm/vllm-openai:deepseekv41-flash-0909-arm64` 打上 `vllm-dsv41:overlay1` 的 tag
+> 再从 overlay3 往下走。那个镜像带分支代码，但**不带**为 sm_121a 重编的
+> `_C_stable_libtorch` —— 而那正是 overlay1 在 GB10 上存在的理由。这条路本仓库没验证过，
+> 如果加载时死在某个 kernel 里，就还是得老老实实做 overlay1。
 
 overlay 链解决的问题：
 
@@ -335,6 +354,7 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 | 现象 | 原因 / 处理 |
 |---|---|
 | `Missing cluster.env.` | `cp scripts/cluster.env.example scripts/cluster.env` 后填 IP |
+| `failed to compute checksum of ref ... "/vllm": not found` | overlay1 的构建上下文里没有 `build/vllm/`（dsv41-feat 的 Python 树）。跑 `./scripts/build-image.sh --check` 看完整清单 |
 | `exportfs：找不到命令` / `exportfs: command not found` | head 上没装 NFS 服务端。`sudo apt-get install -y nfs-kernel-server`，或直接重跑 `./scripts/fetch-weights.sh nfs`（新版会自己装；权重已下好会跳过下载） |
 | worker 挂载报 `wrong fs type` | worker 上没装 `nfs-common`，同样由 `fetch-weights.sh nfs` 自动处理 |
 | `mount.nfs: access denied by server` | 导出 ACL 不含 worker 实际用的源地址（跨网段/多网卡时最常见）。worker 上 `ip route get <head>` 看 `src`，head 上 `sudo exportfs -v` 看导出给了谁；重跑 `./scripts/fetch-weights.sh nfs` 会按源地址自动重建 ACL |
