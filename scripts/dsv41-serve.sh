@@ -146,8 +146,13 @@ fi
 # load: _init_fused_moe_experts runs after the checkpoint is read.
 # `|| true`: under `set -e` a failing command substitution kills the script, and
 # an unreadable config must not take the launch down silently.
-advice="$(python3 "$PATCH_HOST/dsv41_tp_pad/dsv41_tp_pad.py" --tp "$TP" --model "$WEIGHTS" --shell 2>/dev/null \
-          | sed -n "s/^DSV41_PAD_EXPERT_ADVICE=//p" | sed "s/^'//;s/'\$//" || true)"
+advice_q="$(python3 "$PATCH_HOST/dsv41_tp_pad/dsv41_tp_pad.py" --tp "$TP" --model "$WEIGHTS" --shell 2>/dev/null \
+            | sed -n "s/^DSV41_PAD_EXPERT_ADVICE=//p" || true)"
+# The value is shell-quoted by the plan tool. Let the shell unquote it rather
+# than stripping the outer quotes by hand: an embedded ' comes back as '"'"'
+# and would be printed literally.
+advice=""
+[ -n "$advice_q" ] && advice="$(eval "printf '%s' $advice_q")"
 if [ -n "$advice" ] && [ "${DSV41_FORCE_EXPERTS:-0}" != 1 ]; then
   echo "[guard] $advice"
   echo
