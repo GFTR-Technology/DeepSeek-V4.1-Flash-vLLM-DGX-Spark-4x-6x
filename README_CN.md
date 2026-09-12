@@ -106,7 +106,16 @@ worker 上不需要 `cluster.env`（始终从 head 启动就行），但**必须
 | `nfs` | 下载 + 从 head 导出只读 NFS + 每个 worker 挂到 `$WORKER_WEIGHTS` + 写 `/etc/fstab`。**这是本仓库的推荐做法**：510 GB 只存一份 |
 | `rsync` | 下载 + 复制到每个 worker（每台各需 510 GB） |
 
+`nfs` 模式需要 head 上有 NFS **服务端**（`exportfs` 来自 `nfs-kernel-server`），worker 上有**客户端**（`mount.nfs` 来自 `nfs-common`）。DGX Spark 出厂镜像通常只带客户端，所以脚本会自己检测并安装缺的那个；不想让它装就 `DSV41_INSTALL_NFS=0 ./scripts/fetch-weights.sh nfs`，它会告诉你该跑哪条命令：
+
+```bash
+sudo apt-get install -y nfs-kernel-server   # head
+sudo apt-get install -y nfs-common          # 每个 worker
+```
+
 > 一定要写进 `/etc/fstab`。我们有两台 worker 只做了手工挂载，watchdog 复位后就丢了挂载点，表现是加载到一半失败。
+>
+> 权重已经下好的话重跑 `./scripts/fetch-weights.sh nfs` 是安全的：它检测到 `config.json` 就跳过下载，只做导出和挂载。
 >
 > NFS 的代价：head 读权重约 10 分钟，worker 走 NFS 要 10-18 分钟；DSpark 还要再扫一遍全部 48 个分片取 draft 层；head 会等最慢的 worker。head 的 nfsd 线程数会被脚本从 8 提到 32。
 
@@ -305,6 +314,7 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 | `DSV41_SKIP_CLOCK_CHECK` | `0` | 跳过 GPU 时钟预检 |
 | `DSV41_TP_PAD_GROUPS` | `attn,dense,moe` | 只补其中某些组 |
 | `DSV41_TP_PAD_DEBUG` | — | 打印每一个被补齐的张量 |
+| `DSV41_INSTALL_NFS` | `1` | `fetch-weights.sh nfs` 自动安装缺失的 NFS 包；`0` 则只提示 |
 | `DSV41_ENV` | — | `cluster.env` 的绝对路径 |
 
 **两个不能动的参数：**
@@ -318,6 +328,9 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 | 现象 | 原因 / 处理 |
 |---|---|
 | `Missing cluster.env.` | `cp scripts/cluster.env.example scripts/cluster.env` 后填 IP |
+| `exportfs：找不到命令` / `exportfs: command not found` | head 上没装 NFS 服务端。`sudo apt-get install -y nfs-kernel-server`，或直接重跑 `./scripts/fetch-weights.sh nfs`（新版会自己装；权重已下好会跳过下载） |
+| worker 挂载报 `wrong fs type` | worker 上没装 `nfs-common`，同样由 `fetch-weights.sh nfs` 自动处理 |
+| worker 挂载超时 | 从 worker 上 `showmount -e <head>` 看导出；确认 head 放行 2049/tcp |
 | `Error: $ip has 47/48 shards` | NFS 挂载掉了（watchdog 复位后最常见），或没下全。检查 `/etc/fstab` |
 | `Error: image ... missing on $ip` | 镜像是节点本地的，每台都要有。`./scripts/copy-image.sh` |
 | `Error: clone this repo to the same path on $ip` | worker 上缺 `patch/` 或入口脚本；或路径不一致，用 `DSV41_PATCHES` / `DSV41_ENTRYPOINT` 指定 |
