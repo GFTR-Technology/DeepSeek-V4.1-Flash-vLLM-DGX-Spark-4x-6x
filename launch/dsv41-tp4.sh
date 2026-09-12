@@ -7,7 +7,7 @@
 # Knobs (export before running, SAME on all four):
 #   IMAGE        default vllm-dsv41:overlay1 (fallback: vllm/vllm-openai:deepseekv41-flash-0909-arm64)
 #   EXP_NAME     label + per-experiment compile cache dir (default boot1)
-#   GMU          --gpu-memory-utilization (default 0.80)
+#   GMU           (default 0.80)
 #   MAXLEN       --max-model-len (default 131072)
 #   SEQS         --max-num-seqs (default 8)
 #   MAX_BATCHED  --max-num-batched-tokens (default 8192)

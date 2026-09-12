@@ -35,7 +35,7 @@ MAX_MODEL_LEN="${DSV41_MAXLEN:-$_LEN}"
 MAX_NUM_SEQS="${DSV41_SEQS:-$_SEQS}"
 MAX_BATCHED="${DSV41_BATCHED:-8192}"
 EAGER="${DSV41_EAGER:-$_EAGER}"
-GMU="${DSV41_GMU:-0.80}"
+GMU="${DSV41_GMU:-$GMU}"
 SERVED_NAME="${DSV41_SERVED_NAME:-deepseek-v4.1-flash}"
 CUDAGRAPH_MODE="${DSV41_CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}"
 CG_SIZES="${DSV41_CG_SIZES:-}"
@@ -50,7 +50,7 @@ SPEC_ADAPT="${DSV41_SPEC_ADAPT:-false}"
 TEXT_ONLY="${DSV41_TEXT_ONLY:-0}"
 PARSERS="${DSV41_PARSERS:-1}"
 THINKING="${DSV41_THINKING:-false}"
-MIN_AVAIL_GB="${DSV41_MIN_AVAIL_GB:-100}"
+MIN_AVAIL_GB="${DSV41_MIN_AVAIL_GB:-$MIN_AVAIL_GB}"
 TP="${#NODES[@]}"
 
 say()  { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
@@ -76,7 +76,7 @@ if [ "$TP" -gt 1 ]; then
   # One implementation of the plan, shared by this script and the container.
   # It reads the real dimensions out of the checkpoint's config.json, so it
   # cannot drift from the weights the way hard-coded constants would.
-  if PAD_EVAL="$(python3 "$PAD_SHIM_DIR/dsv41_tp_pad.py" --tp "$TP" --model "$WEIGHTS" --shell 2>&1)"; then
+  if PAD_EVAL="$(python3 "$PAD_SHIM_DIR/dsv41_tp_pad.py" --tp "$TP" --model "$WEIGHTS" --spec "$SPEC" --shell 2>&1)"; then
     eval "$PAD_EVAL"
     PAD_ACTIVE="${DSV41_PAD_ACTIVE:-0}"
     [ "$PAD_ACTIVE" = 1 ] && MODEL_DIR="/model-tp${TP}"
@@ -232,6 +232,14 @@ GRAPH_ARGS=()
 if [ "$EAGER" = "1" ]; then
   GRAPH_ARGS=(--enforce-eager)
 else
+  # Without the prestage patch the Engram lookup still happens inside the
+  # forward, and a host round trip cannot be captured: the run dies with
+  # "Engram DISK lookup reached a CUDA-graph capture".
+  if [ "$ENGRAM_DISK" = "1" ] && ! grep -q '^model_state.py ' "$MOUNTS_TXT"; then
+    die "CUDA graphs (EAGER=0) with ENGRAM_DISK=1 need the Engram prestage patch:
+   model_state.py must be listed in $MOUNTS_TXT.
+   Either restore it, or run this lane eager with DSV41_EAGER=1."
+  fi
   if [ -z "$CG_SIZES" ]; then
     if [ "$SPEC" = "dspark" ]; then
       CG_SIZES=$( { seq "$SPEC_K" "$SPEC_K" $((SPEC_K * MAX_NUM_SEQS)); \

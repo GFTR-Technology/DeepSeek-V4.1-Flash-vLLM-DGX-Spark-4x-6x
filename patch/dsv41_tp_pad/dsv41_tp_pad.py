@@ -137,6 +137,11 @@ def _quant_blocks(raw: dict) -> tuple:
     return tuple(sorted(set(sizes))) if sizes else (DEFAULT_BLOCK,)
 
 
+#: an expert count that belongs to the speculative draft model, not the
+#: backbone. With speculative decoding off the draft is never built, so its
+#: count cannot assert and must not block the boot.
+_DRAFT_EXPERT_KEY = re.compile(r"dspark|draft|mtp|eagle|specul", re.I)
+
 _EXPERT_KEY = re.compile(r"(^|_)(n_routed_experts|num_experts|n_experts"
                          r"|n_physical_experts|num_local_experts)$")
 
@@ -221,8 +226,7 @@ class PadPlan:
             return None
         return _round_up(self.dims.vocab_size, self.vocab_pad_to)
 
-    @property
-    def expert_advice(self) -> "str | None":
+    def expert_advice(self, spec: str = "dspark") -> "str | None":
         """Experts are sharded by count, and a dummy expert is not inert.
 
         The router computes its logits as ``x @ w_router.T``: a zero row scores
@@ -230,21 +234,46 @@ class PadPlan:
         output. vLLM's own remedy is ``num_redundant_experts`` — replicas of real
         experts — which is what its assertion message points at. This is only
         advice; nothing here can fix it.
+
+        ``spec`` is the speculative method in force. With it off, draft-only
+        counts are dropped -- otherwise this would block the very command it
+        recommends.
         """
         bad = [(k, v) for k, v in self.dims.expert_counts if v % self.tp]
+        if spec in ("", "none", "off", "0"):
+            bad = [(k, v) for k, v in bad if not _DRAFT_EXPERT_KEY.search(k)]
         if not bad:
             return None
+        # num_redundant_experts is GLOBAL: the same r is added to every MoE. A
+        # single r works only if every count needs the same residue.
+        relevant = [(k, v) for k, v in self.dims.expert_counts
+                    if not (spec in ("", "none", "off", "0")
+                            and _DRAFT_EXPERT_KEY.search(k))]
         bits = ", ".join(f"{k}={v} (needs +{(-v) % self.tp})" for k, v in bad)
-        need = (-bad[0][1]) % self.tp
-        return (f"expert counts that do not divide tp={self.tp}: {bits}. Experts "
+        needs = {(-v) % self.tp for _, v in relevant}
+        head = (f"expert counts that do not divide tp={self.tp}: {bits}. Experts "
                 f"shard by COUNT and a dummy expert is NOT inert (a zero router "
                 f"row scores 0.0 and top-k can pick it), so this cannot be padded. "
-                f"vLLM will assert in _init_fused_moe_experts. Either enable EPLB "
-                f"with matching replicas -- '--enable-eplb --eplb-config "
-                f'{{"num_redundant_experts":{need}}}\' (the config alone is '
-                f"rejected: 'num_redundant_experts is set but EPLB is not "
-                f"enabled') -- or drop the component that carries the odd count, "
-                f"DSV41_SPEC=none if it is only the DSpark draft.")
+                f"vLLM will assert in _init_fused_moe_experts. ")
+        if len(needs) == 1:
+            need = needs.pop()
+            return (head + f"Enable EPLB with matching replicas: '--enable-eplb "
+                    f'--eplb-config {{"num_redundant_experts":{need}}}\' (the '
+                    f"config alone is rejected: 'num_redundant_experts is set but "
+                    f"EPLB is not enabled'). Or drop the component that carries "
+                    f"the odd count -- DSV41_SPEC=none if it is only the DSpark "
+                    f"draft.")
+        # No common r: the counts disagree on the residue they need.
+        vals = sorted({v for _, v in relevant})
+        feasible = [t for t in range(2, 4 * self.tp + 1)
+                    if len({(-v) % t for v in vals}) == 1]
+        return (head + f"num_redundant_experts CANNOT fix this: it is global, and "
+                f"these counts {vals} need different residues mod {self.tp} "
+                f"({sorted(needs)}). For one r to exist, tp must divide every "
+                f"pairwise difference ({', '.join(str(vals[i+1]-vals[i]) for i in range(len(vals)-1))}), "
+                f"which tp={self.tp} does not. TP values that would work: "
+                f"{feasible}. So at tp={self.tp} you must drop the component with "
+                f"the odd count -- DSV41_SPEC=none for the DSpark draft.")
 
     @property
     def active(self) -> bool:
@@ -706,6 +735,9 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", default=os.environ.get("DSV41_MODEL_SRC", "/model"),
                         help="model directory holding config.json")
     parser.add_argument("--groups", default="")
+    parser.add_argument("--spec", default="dspark",
+                        help="speculative method in force; 'none' drops "
+                             "draft-only expert counts from the advice")
     parser.add_argument("--shell", action="store_true",
                         help="emit eval-able shell assignments instead of prose")
     args = parser.parse_args(argv)
@@ -730,7 +762,8 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"DSV41_PAD_INTERMEDIATE={sh(plan.intermediate)}")
         print(f"DSV41_PAD_VOCAB={sh(plan.vocab_padded)}")
         import shlex as _sh
-        print(f"DSV41_PAD_EXPERT_ADVICE={_sh.quote(plan.expert_advice or '')}")
+        print(f"DSV41_PAD_EXPERT_ADVICE="
+              f"{_sh.quote(plan.expert_advice(args.spec) or '')}")
         return 0
 
     d = plan.dims
@@ -751,8 +784,9 @@ def _main(argv: list[str] | None = None) -> int:
     for rule in build_rules(plan):
         print(f"  {rule.group:6s} {rule.what:22s} dim{rule.dim} "
               f"{rule.old} -> {rule.new}  [{rule.mode}]")
-    if plan.expert_advice:
-        print(f"\n  WARNING {plan.expert_advice}")
+    advice = plan.expert_advice(args.spec)
+    if advice:
+        print(f"\n  WARNING {advice}")
     return 0
 
 

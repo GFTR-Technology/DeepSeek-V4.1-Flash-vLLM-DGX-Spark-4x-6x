@@ -5,7 +5,7 @@
 #   DSV41_LANE=1m   ./scripts/dsv41-serve.sh            # 1M context (eager)
 #   DSV41_LANE=128k ./scripts/dsv41-serve.sh
 #   DSV41_ENGRAM_LOCAL=1 ./scripts/dsv41-serve.sh       # node-local Engram rows
-#   ./scripts/dsv41-serve.sh stop|status|logs|logs-all|dry-run
+#   ./scripts/dsv41-serve.sh stop|status|mem|logs|logs-all|dry-run
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
@@ -29,8 +29,29 @@ case "${1:-start}" in
       ssh_to "$ip" "docker ps --filter name=$NAME --format '{{.Status}}'" 2>/dev/null || echo unreachable
     done
     echo
+    echo "--- memory on all nodes (GiB: total / used / available / swap used) ---"
+    # On GB10 this is the GPU pool too. 'available' is what the next boot gets;
+    # the load needs ~100. Swap in use means the box is already thrashing.
+    for ip in "${NODES[@]}"; do
+      printf '%-16s ' "$ip"
+      ssh_to "$ip" "free -g | awk '/^Mem:/{t=\$2;u=\$3;a=\$7} /^Swap:/{s=\$3} END{printf \"%3d / %3d / %3d / swap %d\\n\", t, u, a, s}'" 2>/dev/null \
+        || echo unreachable
+    done
+    echo
     echo "--- /v1/models on $HEAD_IP:$PORT ---"
     curl -s --max-time 5 "http://${HEAD_IP}:${PORT}/v1/models" 2>/dev/null | python3 -m json.tool 2>/dev/null || echo "(API not ready yet)"
+    exit 0
+    ;;
+  mem)
+    # Who is holding memory on each node, when a boot dies or freezes for space.
+    for ip in "${NODES[@]}"; do
+      echo
+      echo "############ $ip ############"
+      ssh_to "$ip" "free -g; echo; echo '-- top processes by RSS --'; \
+        ps -eo rss,pid,comm --sort=-rss | awk 'NR>1 && \$1>1048576 {printf \"%6.1f GiB  %6s  %s\\n\", \$1/1048576, \$2, \$3}' | head -12; \
+        echo; echo '-- containers --'; docker ps -a --format '{{.Names}}  {{.Status}}'" 2>/dev/null \
+        || echo "  unreachable"
+    done
     exit 0
     ;;
   logs)
@@ -62,7 +83,7 @@ case "${1:-start}" in
   start)
     ;;
   *)
-    echo "Usage: $0 {start|stop|status|logs|logs-all [N]|dry-run}"
+    echo "Usage: $0 {start|stop|status|mem|logs|logs-all [N]|dry-run}"
     exit 1
     ;;
 esac
@@ -146,7 +167,11 @@ fi
 # load: _init_fused_moe_experts runs after the checkpoint is read.
 # `|| true`: under `set -e` a failing command substitution kills the script, and
 # an unreadable config must not take the launch down silently.
-advice_q="$(python3 "$PATCH_HOST/dsv41_tp_pad/dsv41_tp_pad.py" --tp "$TP" --model "$WEIGHTS" --shell 2>/dev/null \
+# Same default as dsv41-node-launch.sh. With DSpark off the draft model is
+# never built, so its expert count must not block the launch -- this guard
+# used to reject the very command it recommends.
+SPEC="${DSV41_SPEC:-dspark}"
+advice_q="$(python3 "$PATCH_HOST/dsv41_tp_pad/dsv41_tp_pad.py" --tp "$TP" --model "$WEIGHTS" --spec "$SPEC" --shell 2>/dev/null \
             | sed -n "s/^DSV41_PAD_EXPERT_ADVICE=//p" || true)"
 # The value is shell-quoted by the plan tool. Let the shell unquote it rather
 # than stripping the outer quotes by hand: an embedded ' comes back as '"'"'

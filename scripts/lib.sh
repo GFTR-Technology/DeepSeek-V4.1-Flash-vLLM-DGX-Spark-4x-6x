@@ -48,6 +48,12 @@ require_cluster() {
   : "${NCCL_IB_HCA:=rocep1s0f0,roceP2p1s0f0}"
   : "${NCCL_SOCKET_IFNAME:=enp1s0f0np0,enP2p1s0f0np0}"
   : "${GLOO_SOCKET_IFNAME:=enp1s0f0np0}"
+  # --gpu-memory-utilization. On GB10 the "GPU pool" IS host memory, so this is
+  # the single most useful knob when a boot dies for space. Measured at TP=4:
+  # 81.58 GiB of weights per rank, 1.99+0.55 GiB of CUDA graphs, 5.15 GiB of KV.
+  : "${GMU:=0.80}"
+  # Refuse to start below this much MemAvailable, per node (GiB).
+  : "${MIN_AVAIL_GB:=100}"
   : "${ENGRAM_DISK:=1}"
   # On by default: reading Engram rows over NFS costs 5.9-7.8 ms per step against
   # 2.8 ms locally, and every step waits for the slowest rank. A node without a

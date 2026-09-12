@@ -59,6 +59,8 @@ cp scripts/cluster.env.example scripts/cluster.env   # IP、用户、网卡，�
 | `WORKER_WEIGHTS` | worker 上看到同一份权重的路径（NFS 挂载点）。路径相同就删掉这行 |
 | `CACHE` | 编译缓存目录，默认 `/var/tmp/dsv41-vllm-cache` 即可 |
 | `IMAGE` | 引擎镜像。`build-image.sh` 产出的 `vllm-dsv41:overlay5`（实测数字都来自它），或官方 day-0 镜像 `vllm/vllm-openai:deepseekv41-flash-0909-arm64`（见[第 5 节](#5-引擎镜像)的保留意见） |
+| `GMU` | `--gpu-memory-utilization`。**显存不够时先动这个**，见下 |
+| `MIN_AVAIL_GB` | 低于这个可用内存就拒绝启动（GiB），默认 100 |
 | `ENGRAM_DISK` / `ENGRAM_LOCAL` | Engram 放磁盘（必须 1）/ 挂载节点本地行副本（**默认 1**，见[第 10 节](#10-节点本地-engram-行默认启用)） |
 
 在 Spark 上怎么找 fabric IP 和 HCA：
@@ -382,7 +384,7 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 |---|---|---|
 | `DSV41_LANE` | `300k` | `128k` / `300k` / `1m` |
 | `DSV41_MAXLEN` / `DSV41_SEQS` / `DSV41_BATCHED` | 随档位 | 单独覆盖上下文/并发槽/batched tokens |
-| `DSV41_GMU` | `0.80` | `--gpu-memory-utilization` |
+| `DSV41_GMU` | 随 `cluster.env`（默认 `0.80`） | 临时覆盖 `--gpu-memory-utilization` |
 | `DSV41_EAGER` | 随档位 | `1` 关掉 CUDA graphs |
 | `DSV41_SPEC` / `DSV41_SPEC_K` | `dspark` / `5` | 投机解码；`DSV41_SPEC=none` 关掉 |
 | `DSV41_SPEC_ADAPT` | `false` | 自适应验证。开了会强制变长 FULL 图并补零行，是 #5015 的触发条件 |
@@ -408,6 +410,33 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 
 ---
 
+### 显存不够时怎么调
+
+GB10 上"显存"就是那 128 GB 统一内存，和页缓存、系统其它东西抢。`GMU` 写在
+`cluster.env` 里，也可以 `DSV41_GMU=0.75 ./scripts/dsv41-serve.sh` 临时覆盖。
+
+TP=4、gmu 0.80 的实测分配：每 rank 权重 81.58 GiB（含 DSpark draft 层和视觉编码器）、
+CUDA graphs 1.99 + 0.55 GiB、KV 池 5.15 GiB（300K 下 1,070,168 tokens）。
+
+| 症状 | 怎么办 |
+|---|---|
+| **加载权重时**就崩 | 调低 `GMU`（0.78 → 0.75 → …）。节点越少每 rank 权重越多，TP=4 比 TP=6 更吃紧 |
+| 权重加载完、KV 初始化时崩 | 同样调低：KV 池是权重和 graphs 之后剩下的部分 |
+| 能起来，想要更大 KV | 调高（0.85 只在精简过的系统上用） |
+
+按代价从小到大，还能这样腾地方：
+
+```bash
+DSV41_TEXT_ONLY=1 ./scripts/dsv41-serve.sh   # 不加载视觉编码器，每 rank 省约 0.22 GiB
+DSV41_LANE=128k   ./scripts/dsv41-serve.sh   # 上下文短，indexer prefill buffer 小很多
+DSV41_SPEC=none   ./scripts/dsv41-serve.sh   # 不加载 DSpark draft 层
+```
+
+`MIN_AVAIL_GB`（默认 100）是启动前的可用内存下限：加载要吃掉 121.7 GiB 里的约 100 GiB，
+残留页缓存就是十分钟后被 OOM kill 的原因。每次启动都会先 `drop_caches` 再检查。
+
+---
+
 ## 13. 故障排查
 
 | 现象 | 原因 / 处理 |
@@ -430,6 +459,7 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 | `Error: image ... missing on $ip` | 镜像是节点本地的，每台都要有。`./scripts/copy-image.sh` |
 | `Error: clone this repo to the same path on $ip` | worker 上缺 `patch/` 或入口脚本；或路径不一致，用 `DSV41_PATCHES` / `DSV41_ENTRYPOINT` 指定 |
 | `$ip: WEDGED — SM xxx MHz` | GPU 时钟闩锁，**拔电源冷启动 30-60 秒**，重启没用（[详情](docs/gpu-clock-latch.md)） |
+| 加载权重时报显存/内存不足 | 调低 `cluster.env` 里的 `GMU`，或 `DSV41_GMU=0.75` 临时试。见上一节的对照表 |
 | `MemAvailable ... refusing to boot` | 有残留进程占着统一内存；先 `./scripts/dsv41-serve.sh stop`，再重来 |
 | 启动卡在 distributed init | 上一轮的 head 还活着。`./scripts/dsv41-serve.sh stop` 全清后重来 |
 | 吞吐只有一半，NCCL 日志只出现一个 HCA | 双通道退化。跑 `./scripts/roce-check.sh`，通常是 rail 1 有链路无路由 |
