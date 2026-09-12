@@ -332,6 +332,9 @@ if [ "$PAD_ACTIVE" = 1 ]; then
   printf '   groups  %s\n' "${DSV41_PAD_GROUPS}"
   printf '   serving %s (config overlay, symlinks to /model)\n' "$MODEL_DIR"
   printf '   lane seq counts were measured at TP=4; re-bench\n'
+  # Experts shard by count and cannot be padded inertly — the plan can only warn.
+  [ -n "${DSV41_PAD_EXPERT_ADVICE:-}" ] \
+    && printf '\033[33m   ! %s\033[0m\n' "$DSV41_PAD_EXPERT_ADVICE"
 fi
 [ "$DRYRUN" = 1 ] && echo "   (dry-run — nothing will be executed)"
 

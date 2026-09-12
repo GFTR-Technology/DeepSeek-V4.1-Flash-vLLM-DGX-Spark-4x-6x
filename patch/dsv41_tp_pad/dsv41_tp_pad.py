@@ -99,6 +99,7 @@ class Dims:
     moe_intermediate: "int | None" = None
     intermediate: "int | None" = None
     vocab_size: "int | None" = None
+    n_routed_experts: "int | None" = None
     block: int = DEFAULT_BLOCK
     #: every distinct quantization block the checkpoint declares. A tensor
     #: may only be treated as a scale of another if their sizes differ by
@@ -163,6 +164,7 @@ def load_dims(model_dir: str) -> Dims:
         moe_intermediate=opt("moe_intermediate_size"),
         intermediate=opt("intermediate_size"),
         vocab_size=opt("vocab_size"),
+        n_routed_experts=opt("n_routed_experts"),
         # The coarsest block drives the lcm rounding; the whole set drives
         # which size ratios may be read as "this is a scale of that".
         block=max(_quant_blocks(raw)),
@@ -194,6 +196,26 @@ class PadPlan:
         if not self.dims.vocab_size:
             return None
         return _round_up(self.dims.vocab_size, self.vocab_pad_to)
+
+    @property
+    def expert_advice(self) -> "str | None":
+        """Experts are sharded by count, and a dummy expert is not inert.
+
+        The router computes its logits as ``x @ w_router.T``: a zero row scores
+        0.0 and top-k can pick it, so padding the expert count would change the
+        output. vLLM's own remedy is ``num_redundant_experts`` — replicas of real
+        experts — which is what its assertion message points at. This is only
+        advice; nothing here can fix it.
+        """
+        n = self.dims.n_routed_experts
+        if not n or n % self.tp == 0:
+            return None
+        need = (-n) % self.tp
+        return (f"n_routed_experts={n} does not divide tp={self.tp}. vLLM will "
+                f"assert in _init_fused_moe_experts. Try num_redundant_experts="
+                f"{need} ({n} + {need} = {n + need} = {self.tp} x {(n + need) // self.tp}), "
+                f"or run without DSpark (DSV41_SPEC=none) if only the draft model "
+                f"trips it.")
 
     @property
     def active(self) -> bool:
@@ -678,6 +700,8 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"DSV41_PAD_MOE_INTERMEDIATE={sh(plan.moe_intermediate)}")
         print(f"DSV41_PAD_INTERMEDIATE={sh(plan.intermediate)}")
         print(f"DSV41_PAD_VOCAB={sh(plan.vocab_padded)}")
+        import shlex as _sh
+        print(f"DSV41_PAD_EXPERT_ADVICE={_sh.quote(plan.expert_advice or '')}")
         return 0
 
     d = plan.dims
@@ -685,7 +709,8 @@ def _main(argv: list[str] | None = None) -> int:
     print(f"  checkpoint: heads={d.heads} o_groups={d.groups} "
           f"head_dim={d.head_dim} o_lora_rank={d.o_lora_rank} "
           f"moe_intermediate={d.moe_intermediate} intermediate={d.intermediate} "
-          f"vocab={d.vocab_size} quant blocks={list(d.blocks)}")
+          f"vocab={d.vocab_size} experts={d.n_routed_experts} "
+          f"quant blocks={list(d.blocks)}")
     missing = [k for k, v in (("o_groups", d.groups), ("head_dim", d.head_dim),
                               ("vocab_size", d.vocab_size),
                               ("o_lora_rank", d.o_lora_rank),
@@ -697,6 +722,8 @@ def _main(argv: list[str] | None = None) -> int:
     for rule in build_rules(plan):
         print(f"  {rule.group:6s} {rule.what:22s} dim{rule.dim} "
               f"{rule.old} -> {rule.new}  [{rule.mode}]")
+    if plan.expert_advice:
+        print(f"\n  WARNING {plan.expert_advice}")
     return 0
 
 
