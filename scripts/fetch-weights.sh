@@ -65,10 +65,68 @@ case "$MODE" in
     ensure_pkg head exportfs nfs-kernel-server "NFS server" || exit 1
     sudo systemctl enable --now nfs-kernel-server >/dev/null 2>&1 || true
 
-    echo "==> exporting $EXPORT_DIR read-only over NFS"
-    subnet="$(echo "$HEAD_IP" | cut -d. -f1-3).0/24"
-    line="$EXPORT_DIR ${subnet}(ro,sync,no_subtree_check)"
-    grep -qF "$line" /etc/exports 2>/dev/null || echo "$line" | sudo tee -a /etc/exports >/dev/null
+    # Every parent of the export has to be traversable by the identity the
+    # client ends up with. The container runs as root, root_squash maps that to
+    # nobody, and a 0700 directory (/root above all) stops nobody dead — the
+    # mount succeeds and every read then fails. Catch it here, not 12 minutes
+    # into a weight load.
+    blocker=""; blocker_mode=""
+    p="$EXPORT_DIR"
+    while [ -n "$p" ] && [ "$p" != "/" ]; do
+      m="$(stat -c '%a' "$p" 2>/dev/null)" || break
+      case "$m" in *[1357]) ;; *) blocker="$p"; blocker_mode="$m"; break ;; esac
+      p="$(dirname "$p")"
+    done
+    if [ -n "$blocker" ]; then
+      echo "    $blocker is mode $blocker_mode — not traversable by others."
+      echo "    With root_squash the worker reads as nobody, so the mount would"
+      echo "    succeed and every read would fail. Pick one:"
+      echo "      a) move the weights somewhere world-traversable (what the recipe"
+      echo "         uses) and point WEIGHTS at it:"
+      echo "           sudo mkdir -p /var/tmp/models"
+      echo "           sudo mv $WEIGHTS /var/tmp/models/"
+      echo "           # cluster.env: WEIGHTS=/var/tmp/models/$(basename "$WEIGHTS")"
+      echo "      b) open the path up:  sudo chmod o+x $blocker"
+      echo "      c) export with no_root_squash (weaker):"
+      echo "           DSV41_NFS_OPTS=ro,sync,no_subtree_check,no_root_squash $0 nfs"
+      echo "      DSV41_ALLOW_PRIVATE_EXPORT=1 skips this check."
+      [ "${DSV41_ALLOW_PRIVATE_EXPORT:-0}" = 1 ] || exit 1
+    fi
+
+    # Which addresses may mount. Guessing HEAD_IP's /24 is wrong the moment the
+    # fleet spans subnets or a node is multi-homed, so ask each worker which
+    # source address it will actually reach the head from. Override with
+    # NFS_EXPORT_CLIENTS in cluster.env ("10.10.0.0/16", or a space list).
+    NFS_OPTS="${DSV41_NFS_OPTS:-ro,sync,no_subtree_check}"
+    if [ -n "${NFS_EXPORT_CLIENTS:-}" ]; then
+      clients="$NFS_EXPORT_CLIENTS"
+    else
+      clients=""
+      for w in $WORKER_IPS; do
+        src="$(ssh_to "$w" "ip route get $HEAD_IP 2>/dev/null" 2>/dev/null \
+               | sed -n 's/.*[[:space:]]src[[:space:]]\([0-9.]*\).*/\1/p' | head -1)"
+        if [ -z "$src" ]; then
+          echo "    could not ask $w which address it reaches $HEAD_IP from; using $w"
+          src="$w"
+        elif [ "$src" != "$w" ]; then
+          echo "    $w reaches the head as $src (multi-homed) — exporting to both"
+          clients="$clients $w"
+        fi
+        clients="$clients $src"
+      done
+      # de-duplicate
+      clients="$(printf '%s\n' $clients | sort -u | tr '\n' ' ')"
+    fi
+    echo "==> exporting $EXPORT_DIR ($NFS_OPTS) to:$clients"
+    spec=""
+    for c in $clients; do spec="$spec ${c}($NFS_OPTS)"; done
+    line="$EXPORT_DIR$spec"
+    # Rewrite our own line rather than appending: a stale entry for the same path
+    # would otherwise stack up and the first match wins.
+    tmp="$(mktemp)"
+    awk -v d="$EXPORT_DIR" '$1 != d' /etc/exports > "$tmp" 2>/dev/null || true
+    printf '%s\n' "$line" >> "$tmp"
+    sudo cp "$tmp" /etc/exports && rm -f "$tmp"
     sudo exportfs -ra || { echo "exportfs failed; check /etc/exports"; exit 1; }
     sudo exportfs -v 2>/dev/null | sed 's/^/    /' || true
     # 8 nfsd threads queue badly when several workers read weights at once.
@@ -85,8 +143,10 @@ case "$MODE" in
         ls $WORKER_WEIGHTS/config.json >/dev/null" \
         && echo "    ok $w" || {
           echo "    FAIL $w"
-          echo "       check from the worker: showmount -e $HEAD_IP"
-          echo "       and on the head that the firewall allows 2049/tcp from $w"
+          echo "       from the worker:  showmount -e $HEAD_IP"
+          echo "                         ip route get $HEAD_IP     # the source address the export must list"
+          echo "       on the head:      sudo exportfs -v          # what is actually exported"
+          echo "                         and that the firewall allows 2049/tcp from $w"
           exit 1; }
       # Two of our workers had this only as a manual mount and lost it after a
       # watchdog reset. Persist it.

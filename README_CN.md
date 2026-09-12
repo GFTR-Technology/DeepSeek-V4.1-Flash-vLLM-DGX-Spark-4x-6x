@@ -106,6 +106,10 @@ worker 上不需要 `cluster.env`（始终从 head 启动就行），但**必须
 | `nfs` | 下载 + 从 head 导出只读 NFS + 每个 worker 挂到 `$WORKER_WEIGHTS` + 写 `/etc/fstab`。**这是本仓库的推荐做法**：510 GB 只存一份 |
 | `rsync` | 下载 + 复制到每个 worker（每台各需 510 GB） |
 
+**权重放哪很重要。** 导出目录的每一级父目录都必须对 others 可穿越（`o+x`）。容器以 root 运行，NFS 默认的 `root_squash` 把它映射成 `nobody`，而 `/root` 是 0700——挂载会成功，但每次读都失败。脚本会在导出前逐级检查并拒绝继续，给出三个选择（挪到 `/var/tmp/models`、`chmod o+x`、或用 `no_root_squash` 导出）。推荐第一个，也就是本仓库默认的 `WEIGHTS=/var/tmp/models/DeepSeek-V4.1-Flash`。
+
+**导出 ACL 按节点实际源地址生成。** 脚本不再猜 `HEAD_IP` 的 /24——集群跨网段或节点多网卡时那就是错的。它逐个问 worker `ip route get $HEAD_IP`，拿到它真正用来连 head 的源地址，把这些地址（以及 `cluster.env` 里写的地址）都写进 `/etc/exports`。特殊拓扑可以在 `cluster.env` 里用 `NFS_EXPORT_CLIENTS="10.10.0.0/16"` 直接指定。同一导出路径的旧条目会被重写而不是追加，避免堆积后第一条生效。
+
 `nfs` 模式需要 head 上有 NFS **服务端**（`exportfs` 来自 `nfs-kernel-server`），worker 上有**客户端**（`mount.nfs` 来自 `nfs-common`）。DGX Spark 出厂镜像通常只带客户端，所以脚本会自己检测并安装缺的那个；不想让它装就 `DSV41_INSTALL_NFS=0 ./scripts/fetch-weights.sh nfs`，它会告诉你该跑哪条命令：
 
 ```bash
@@ -315,6 +319,9 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 | `DSV41_TP_PAD_GROUPS` | `attn,dense,moe` | 只补其中某些组 |
 | `DSV41_TP_PAD_DEBUG` | — | 打印每一个被补齐的张量 |
 | `DSV41_INSTALL_NFS` | `1` | `fetch-weights.sh nfs` 自动安装缺失的 NFS 包；`0` 则只提示 |
+| `NFS_EXPORT_CLIENTS` | 自动探测 | 覆盖导出 ACL，例如 `10.10.0.0/16` 或空格分隔的地址列表（写在 `cluster.env` 里） |
+| `DSV41_NFS_OPTS` | `ro,sync,no_subtree_check` | 导出选项，需要时可加 `no_root_squash` |
+| `DSV41_ALLOW_PRIVATE_EXPORT` | `0` | 跳过导出路径可穿越性检查 |
 | `DSV41_ENV` | — | `cluster.env` 的绝对路径 |
 
 **两个不能动的参数：**
@@ -330,6 +337,8 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 | `Missing cluster.env.` | `cp scripts/cluster.env.example scripts/cluster.env` 后填 IP |
 | `exportfs：找不到命令` / `exportfs: command not found` | head 上没装 NFS 服务端。`sudo apt-get install -y nfs-kernel-server`，或直接重跑 `./scripts/fetch-weights.sh nfs`（新版会自己装；权重已下好会跳过下载） |
 | worker 挂载报 `wrong fs type` | worker 上没装 `nfs-common`，同样由 `fetch-weights.sh nfs` 自动处理 |
+| `mount.nfs: access denied by server` | 导出 ACL 不含 worker 实际用的源地址（跨网段/多网卡时最常见）。worker 上 `ip route get <head>` 看 `src`，head 上 `sudo exportfs -v` 看导出给了谁；重跑 `./scripts/fetch-weights.sh nfs` 会按源地址自动重建 ACL |
+| 挂载成功但读文件 `Permission denied` | 导出路径某级父目录不是 `o+x`（`/root` 是 0700），`root_squash` 下读不了。把权重挪到 `/var/tmp/models` 并改 `cluster.env` 的 `WEIGHTS` |
 | worker 挂载超时 | 从 worker 上 `showmount -e <head>` 看导出；确认 head 放行 2049/tcp |
 | `Error: $ip has 47/48 shards` | NFS 挂载掉了（watchdog 复位后最常见），或没下全。检查 `/etc/fstab` |
 | `Error: image ... missing on $ip` | 镜像是节点本地的，每台都要有。`./scripts/copy-image.sh` |
