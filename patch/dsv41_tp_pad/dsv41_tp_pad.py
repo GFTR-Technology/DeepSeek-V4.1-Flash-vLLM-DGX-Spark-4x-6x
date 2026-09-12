@@ -99,7 +99,9 @@ class Dims:
     moe_intermediate: "int | None" = None
     intermediate: "int | None" = None
     vocab_size: "int | None" = None
-    n_routed_experts: "int | None" = None
+    #: every {key: value} in the config that looks like an expert count,
+    #: including any nested draft/dspark section. Experts shard by COUNT.
+    expert_counts: tuple = ()
     block: int = DEFAULT_BLOCK
     #: every distinct quantization block the checkpoint declares. A tensor
     #: may only be treated as a scale of another if their sizes differ by
@@ -135,6 +137,28 @@ def _quant_blocks(raw: dict) -> tuple:
     return tuple(sorted(set(sizes))) if sizes else (DEFAULT_BLOCK,)
 
 
+_EXPERT_KEY = re.compile(r"(^|_)(n_routed_experts|num_experts|n_experts"
+                         r"|n_physical_experts|num_local_experts)$")
+
+
+def _expert_counts(raw: dict, _path: str = "") -> tuple:
+    """Walk the whole config for expert counts, nested sections included.
+
+    The DSpark draft layers carry their own count, and it need not match the
+    backbone's: the backbone built fine at TP=6 while the draft asserted with
+    n_physical_experts=128. Reading one top-level key would miss that.
+    """
+    found = []
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            here = f"{_path}.{k}" if _path else k
+            if isinstance(v, int) and v > 1 and _EXPERT_KEY.search(k):
+                found.append((here, v))
+            elif isinstance(v, dict):
+                found.extend(_expert_counts(v, here))
+    return tuple(found)
+
+
 def load_dims(model_dir: str) -> Dims:
     path = os.path.join(model_dir, "config.json")
     with open(path, "r", encoding="utf-8") as handle:
@@ -164,7 +188,7 @@ def load_dims(model_dir: str) -> Dims:
         moe_intermediate=opt("moe_intermediate_size"),
         intermediate=opt("intermediate_size"),
         vocab_size=opt("vocab_size"),
-        n_routed_experts=opt("n_routed_experts"),
+        expert_counts=_expert_counts(raw),
         # The coarsest block drives the lcm rounding; the whole set drives
         # which size ratios may be read as "this is a scale of that".
         block=max(_quant_blocks(raw)),
@@ -207,15 +231,20 @@ class PadPlan:
         experts — which is what its assertion message points at. This is only
         advice; nothing here can fix it.
         """
-        n = self.dims.n_routed_experts
-        if not n or n % self.tp == 0:
+        bad = [(k, v) for k, v in self.dims.expert_counts if v % self.tp]
+        if not bad:
             return None
-        need = (-n) % self.tp
-        return (f"n_routed_experts={n} does not divide tp={self.tp}. vLLM will "
-                f"assert in _init_fused_moe_experts. Try num_redundant_experts="
-                f"{need} ({n} + {need} = {n + need} = {self.tp} x {(n + need) // self.tp}), "
-                f"or run without DSpark (DSV41_SPEC=none) if only the draft model "
-                f"trips it.")
+        bits = ", ".join(f"{k}={v} (needs +{(-v) % self.tp})" for k, v in bad)
+        need = (-bad[0][1]) % self.tp
+        return (f"expert counts that do not divide tp={self.tp}: {bits}. Experts "
+                f"shard by COUNT and a dummy expert is NOT inert (a zero router "
+                f"row scores 0.0 and top-k can pick it), so this cannot be padded. "
+                f"vLLM will assert in _init_fused_moe_experts. Either enable EPLB "
+                f"with matching replicas -- '--enable-eplb --eplb-config "
+                f'{{"num_redundant_experts":{need}}}\' (the config alone is '
+                f"rejected: 'num_redundant_experts is set but EPLB is not "
+                f"enabled') -- or drop the component that carries the odd count, "
+                f"DSV41_SPEC=none if it is only the DSpark draft.")
 
     @property
     def active(self) -> bool:
@@ -709,7 +738,7 @@ def _main(argv: list[str] | None = None) -> int:
     print(f"  checkpoint: heads={d.heads} o_groups={d.groups} "
           f"head_dim={d.head_dim} o_lora_rank={d.o_lora_rank} "
           f"moe_intermediate={d.moe_intermediate} intermediate={d.intermediate} "
-          f"vocab={d.vocab_size} experts={d.n_routed_experts} "
+          f"vocab={d.vocab_size} experts={list(d.expert_counts)} "
           f"quant blocks={list(d.blocks)}")
     missing = [k for k, v in (("o_groups", d.groups), ("head_dim", d.head_dim),
                               ("vocab_size", d.vocab_size),

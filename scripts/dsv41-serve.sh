@@ -141,6 +141,27 @@ if python3 "$PATCH_HOST/dsv41_tp_pad/dsv41_tp_pad.py" --tp "$TP" --model "$WEIGH
   echo "       run ./scripts/dsv41-tp-probe.sh first if this image is new to you"
 fi
 
+# Expert counts shard by COUNT and cannot be padded inertly, so the plan can only
+# report them. Refuse here rather than let it assert four minutes into a weight
+# load: _init_fused_moe_experts runs after the checkpoint is read.
+# `|| true`: under `set -e` a failing command substitution kills the script, and
+# an unreadable config must not take the launch down silently.
+advice="$(python3 "$PATCH_HOST/dsv41_tp_pad/dsv41_tp_pad.py" --tp "$TP" --model "$WEIGHTS" --shell 2>/dev/null \
+          | sed -n "s/^DSV41_PAD_EXPERT_ADVICE=//p" | sed "s/^'//;s/'\$//" || true)"
+if [ -n "$advice" ] && [ "${DSV41_FORCE_EXPERTS:-0}" != 1 ]; then
+  echo "[guard] $advice"
+  echo
+  echo "        Not launching: this asserts after the weights are loaded, which"
+  echo "        costs about four minutes each attempt. Pick one:"
+  echo "          DSV41_SPEC=none ./scripts/dsv41-serve.sh        # drop DSpark, boots today"
+  echo "          DSV41_EXTRA='--enable-eplb --eplb-config {\"num_redundant_experts\":N}' \\"
+  echo "            ./scripts/dsv41-serve.sh   # the config alone is rejected without --enable-eplb"
+  echo "          DSV41_FORCE_EXPERTS=1 ./scripts/dsv41-serve.sh  # try anyway"
+  echo "        Check the flag name for your build first:"
+  echo "          docker run --rm --entrypoint vllm $IMAGE serve --help | grep -iE 'redundant|eplb'"
+  exit 1
+fi
+
 # Node-local Engram rows are on by default, and "on" has to mean the copies
 # actually exist — mounting a directory nobody built would be a no-op. So build
 # what is missing here. engram-local.sh compares each node's recorded row ranges
