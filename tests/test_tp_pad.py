@@ -104,13 +104,37 @@ def test_plan(m):
     check("heads 64 -> 128", p8.heads, 128)
     check("heads per group still 16", p8.heads // p8.o_groups, 16)
 
-    print("plan: a ragged heads/groups ratio is refused, not guessed")
+    print("plan: a ragged heads/groups ratio falls back to padding heads directly")
+    with tempfile.TemporaryDirectory() as tmp:
+        d_ragged = m.load_dims(write_model(tmp, dict(SOLO, num_attention_heads=65, o_groups=4)))
+    check("o_groups dropped", d_ragged.groups, None)
+    check("heads 65 -> 66 at TP=6", m.plan_for_tp(d_ragged, 6).heads, 66)
+
+    print("plan: optional keys may be absent entirely")
+    with tempfile.TemporaryDirectory() as tmp:
+        d_min = m.load_dims(write_model(tmp, {"num_attention_heads": 64,
+                                              "moe_intermediate_size": 2048}))
+    check("groups absent", d_min.groups, None)
+    check("head_dim absent", d_min.head_dim, None)
+    check("block defaults to 128", d_min.block, 128)
+    # heads grow but head_dim is unknown -> the q projection could not be padded,
+    # so the plan must refuse rather than emit a config the weights cannot satisfy
+    try:
+        m.plan_for_tp(d_min, 6)
+        check("refuses to pad heads without head_dim", "no error", "AssertionError")
+    except AssertionError as exc:
+        check("refuses to pad heads without head_dim", "head_dim" in str(exc), True)
+    # ...but moe-only padding on the same config is fine
+    check("moe-only plan still works",
+          m.plan_for_tp(d_min, 6, ["moe"]).moe_intermediate, 2304)
+
+    print("plan: missing num_attention_heads is fatal")
     with tempfile.TemporaryDirectory() as tmp:
         try:
-            m.load_dims(write_model(tmp, dict(SOLO, num_attention_heads=65, o_groups=4)))
-            check("ragged ratio refused", "no error", "SystemExit")
-        except SystemExit as exc:
-            check("ragged ratio refused", "heads per" in str(exc), True)
+            m.load_dims(write_model(tmp, {"moe_intermediate_size": 2048}))
+            check("no heads refused", "no error", "SystemExit")
+        except SystemExit:
+            check("no heads refused", True, True)
 
     print("plan: groups can be switched off")
     check("attn only", m.plan_for_tp(d, 6, ["attn"]).moe_intermediate, 2048)

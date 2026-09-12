@@ -79,19 +79,25 @@ def _round_up(value: int, multiple: int) -> int:
 
 @dataclass(frozen=True)
 class Dims:
-    """The TP-sensitive extents, as the checkpoint ships them."""
+    """The TP-sensitive extents, as the checkpoint ships them.
+
+    Only ``heads`` is required. Everything else is optional: a checkpoint that
+    does not carry ``o_groups`` simply has its heads padded directly, and rules
+    whose sizes we cannot compute are not emitted. Refusing to plan because one
+    optional key is absent is how you end up booting unpadded.
+    """
 
     heads: int
-    groups: int
-    head_dim: int
-    o_lora_rank: int
-    moe_intermediate: int
-    intermediate: int
-    block: int
+    groups: "int | None" = None
+    head_dim: "int | None" = None
+    o_lora_rank: "int | None" = None
+    moe_intermediate: "int | None" = None
+    intermediate: "int | None" = None
+    block: int = DEFAULT_BLOCK
 
     @property
     def heads_per_group(self) -> int:
-        return self.heads // self.groups
+        return self.heads // self.groups if self.groups else 1
 
 
 def _flatten(raw: dict) -> dict:
@@ -124,30 +130,28 @@ def load_dims(model_dir: str) -> Dims:
         raw = json.load(handle)
     cfg = _flatten(raw)
 
-    def need(key: str) -> int:
+    def opt(key: str):
         v = cfg.get(key)
-        if not isinstance(v, int) or v <= 0:
-            raise SystemExit(
-                f"{LOG_PREFIX} {path}: {key} is {v!r}, expected a positive int. "
-                "The checkpoint changed shape; re-read this module before padding."
-            )
-        return v
+        return v if isinstance(v, int) and v > 0 else None
 
-    heads = need("num_attention_heads")
-    groups = need("o_groups")
-    if heads % groups:
+    heads = opt("num_attention_heads")
+    if heads is None:
         raise SystemExit(
-            f"{LOG_PREFIX} num_attention_heads={heads} is not a whole number of "
-            f"heads per o_groups={groups}. wo_a's per-group input would not be an "
-            "integer; refusing to guess a padding."
+            f"{LOG_PREFIX} {path}: no positive int num_attention_heads. "
+            "Cannot plan TP padding without it."
         )
+    groups = opt("o_groups")
+    if groups is not None and heads % groups:
+        _log(f"WARNING num_attention_heads={heads} is not a whole number of heads "
+             f"per o_groups={groups}; ignoring o_groups and padding heads directly")
+        groups = None
     return Dims(
         heads=heads,
         groups=groups,
-        head_dim=need("head_dim"),
-        o_lora_rank=need("o_lora_rank"),
-        moe_intermediate=need("moe_intermediate_size"),
-        intermediate=need("intermediate_size"),
+        head_dim=opt("head_dim"),
+        o_lora_rank=opt("o_lora_rank"),
+        moe_intermediate=opt("moe_intermediate_size"),
+        intermediate=opt("intermediate_size"),
         block=_quant_block(raw),
     )
 
@@ -174,7 +178,7 @@ class PadPlan:
         d = self.dims
         return (
             self.heads != d.heads
-            or self.o_groups != d.groups
+            or (self.o_groups or 0) != (d.groups or 0)
             or self.moe_intermediate != d.moe_intermediate
             or self.intermediate != d.intermediate
         )
@@ -182,13 +186,13 @@ class PadPlan:
     def summary(self) -> str:
         d = self.dims
         bits = []
-        if self.o_groups != d.groups:
+        if self.o_groups and d.groups and self.o_groups != d.groups:
             bits.append(f"o_groups {d.groups}->{self.o_groups}")
         if self.heads != d.heads:
             bits.append(f"attention heads {d.heads}->{self.heads}")
-        if self.intermediate != d.intermediate:
+        if self.intermediate and d.intermediate and self.intermediate != d.intermediate:
             bits.append(f"dense intermediate {d.intermediate}->{self.intermediate}")
-        if self.moe_intermediate != d.moe_intermediate:
+        if self.moe_intermediate and d.moe_intermediate and self.moe_intermediate != d.moe_intermediate:
             bits.append(
                 f"moe intermediate {d.moe_intermediate}->{self.moe_intermediate}"
             )
@@ -205,8 +209,15 @@ def plan_for_tp(dims: Dims, tp: int, groups: Iterable[str] | None = None) -> Pad
         raise ValueError(f"unknown pad groups: {sorted(unknown)}")
 
     if "attn" in selected:
-        o_groups = _round_up(dims.groups, tp)
-        heads = o_groups * dims.heads_per_group
+        if dims.groups:
+            # wo_a is a bmm over o_groups: pad whole groups, each carrying its
+            # full set of dummy heads, so heads/groups never moves.
+            o_groups = _round_up(dims.groups, tp)
+            heads = o_groups * dims.heads_per_group
+        else:
+            # no grouped output projection in this config: pad heads directly
+            o_groups = None
+            heads = _round_up(dims.heads, tp)
     else:
         o_groups, heads = dims.groups, dims.heads
 
@@ -218,12 +229,12 @@ def plan_for_tp(dims: Dims, tp: int, groups: Iterable[str] | None = None) -> Pad
         o_groups=o_groups,
         moe_intermediate=(
             _round_up(dims.moe_intermediate, tp * dims.block)
-            if "moe" in selected and dims.moe_intermediate % tp
+            if "moe" in selected and dims.moe_intermediate and dims.moe_intermediate % tp
             else dims.moe_intermediate
         ),
         intermediate=(
             _round_up(dims.intermediate, tp * dims.block)
-            if "dense" in selected and dims.intermediate % tp
+            if "dense" in selected and dims.intermediate and dims.intermediate % tp
             else dims.intermediate
         ),
     )
@@ -242,29 +253,44 @@ def _validate(plan: PadPlan) -> None:
     checks = [
         ("attn", "attention heads", plan.heads),
         ("attn", "o_groups", plan.o_groups),
-        ("attn", "wq_b out", plan.heads * d.head_dim),
-        ("attn", "wo_a out", plan.o_groups * d.o_lora_rank),
+        ("attn", "wq_b out", plan.heads * d.head_dim if d.head_dim else None),
+        ("attn", "wo_a out",
+         plan.o_groups * d.o_lora_rank if plan.o_groups and d.o_lora_rank else None),
         ("moe", "moe intermediate", plan.moe_intermediate),
         ("dense", "dense intermediate", plan.intermediate),
     ]
     for group, what, size in checks:
-        if group in plan.groups and size % tp:
+        if group in plan.groups and size and size % tp:
             raise AssertionError(f"{what}={size} is not divisible by tp={tp}")
 
-    if "attn" in plan.groups and plan.heads % plan.o_groups:
+    if "attn" in plan.groups and plan.o_groups and plan.heads % plan.o_groups:
         raise AssertionError(
             f"padded heads={plan.heads} is not a whole number of heads per "
             f"padded o_groups={plan.o_groups}; wo_a's bmm would be re-cut"
         )
 
+    # If the head count grows, the q projection MUST grow with it, or the overlay
+    # advertises more heads than the weights carry and the load fails on a shape
+    # mismatch. That rule needs head_dim, so refuse rather than emit a config the
+    # weights cannot satisfy.
+    if "attn" in plan.groups and plan.heads != d.heads and not d.head_dim:
+        raise AssertionError(
+            f"attention heads would be padded {d.heads}->{plan.heads}, but "
+            "config.json has no head_dim, so the q projection cannot be padded "
+            "to match. Add head_dim to the config, or drop the attn group "
+            "(DSV41_TP_PAD_GROUPS=moe,dense) and pick a TP that divides "
+            f"{d.heads} heads."
+        )
+
     # Blockwise-quantized shards must stay whole blocks on every rank.
     for group, what, size in (
-        ("attn", "wq_b out", plan.heads * d.head_dim),
-        ("attn", "wo_a out", plan.o_groups * d.o_lora_rank),
+        ("attn", "wq_b out", plan.heads * d.head_dim if d.head_dim else None),
+        ("attn", "wo_a out",
+         plan.o_groups * d.o_lora_rank if plan.o_groups and d.o_lora_rank else None),
         ("moe", "moe intermediate", plan.moe_intermediate),
         ("dense", "dense intermediate", plan.intermediate),
     ):
-        if group not in plan.groups:
+        if group not in plan.groups or not size:
             continue
         per_rank = size // tp
         if per_rank % d.block:
@@ -317,12 +343,15 @@ def build_rules(plan: PadPlan) -> list[Rule]:
         rules.append(Rule(group, what, _rx(tail), dim, old, new, mode))
 
     if "attn" in plan.groups:
-        rule("attn", "wq_b out", ".wq_b", 0, d.heads * d.head_dim, plan.heads * d.head_dim)
+        if d.head_dim:
+            rule("attn", "wq_b out", ".wq_b", 0,
+                 d.heads * d.head_dim, plan.heads * d.head_dim)
         rule("attn", "attn sink", ".attn_sink", 0, d.heads, plan.heads, NEG_INF)
-        rule("attn", "wo_a out", ".wo_a", 0,
-             d.groups * d.o_lora_rank, plan.o_groups * d.o_lora_rank)
-        rule("attn", "wo_b in", ".wo_b", 1,
-             d.groups * d.o_lora_rank, plan.o_groups * d.o_lora_rank)
+        if d.groups and plan.o_groups and d.o_lora_rank:
+            rule("attn", "wo_a out", ".wo_a", 0,
+                 d.groups * d.o_lora_rank, plan.o_groups * d.o_lora_rank)
+            rule("attn", "wo_b in", ".wo_b", 1,
+                 d.groups * d.o_lora_rank, plan.o_groups * d.o_lora_rank)
         # wo_a's per-group input is heads*head_dim/groups. Heads and groups grow
         # by the same factor, so it does not move and needs no rule.
     for tail in (".gate_proj", ".up_proj", ".w1", ".w3"):
@@ -531,13 +560,18 @@ def _main(argv: list[str] | None = None) -> int:
     if args.shell:
         import shlex
 
+        # A dimension the config does not carry becomes an empty string, not the
+        # literal "None": these are eval'd by the launcher.
+        def sh(v):
+            return "" if v is None else str(v)
+
         print(f"DSV41_PAD_ACTIVE={1 if plan.active else 0}")
         print(f"DSV41_PAD_SUMMARY={shlex.quote(plan.summary())}")
         print(f"DSV41_PAD_GROUPS={shlex.quote(','.join(sorted(plan.groups)))}")
-        print(f"DSV41_PAD_HEADS={plan.heads}")
-        print(f"DSV41_PAD_O_GROUPS={plan.o_groups}")
-        print(f"DSV41_PAD_MOE_INTERMEDIATE={plan.moe_intermediate}")
-        print(f"DSV41_PAD_INTERMEDIATE={plan.intermediate}")
+        print(f"DSV41_PAD_HEADS={sh(plan.heads)}")
+        print(f"DSV41_PAD_O_GROUPS={sh(plan.o_groups)}")
+        print(f"DSV41_PAD_MOE_INTERMEDIATE={sh(plan.moe_intermediate)}")
+        print(f"DSV41_PAD_INTERMEDIATE={sh(plan.intermediate)}")
         return 0
 
     d = plan.dims
@@ -546,6 +580,12 @@ def _main(argv: list[str] | None = None) -> int:
           f"head_dim={d.head_dim} o_lora_rank={d.o_lora_rank} "
           f"moe_intermediate={d.moe_intermediate} intermediate={d.intermediate} "
           f"quant block={d.block}")
+    missing = [k for k, v in (("o_groups", d.groups), ("head_dim", d.head_dim),
+                              ("o_lora_rank", d.o_lora_rank),
+                              ("moe_intermediate_size", d.moe_intermediate),
+                              ("intermediate_size", d.intermediate)) if v is None]
+    if missing:
+        print(f"  absent from config.json (no rules emitted for them): {', '.join(missing)}")
     print(f"  {plan.summary()}")
     for rule in build_rules(plan):
         print(f"  {rule.group:6s} {rule.what:22s} dim{rule.dim} "

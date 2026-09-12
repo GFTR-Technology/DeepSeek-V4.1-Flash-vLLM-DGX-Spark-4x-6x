@@ -81,12 +81,32 @@ if [ "$TP" -gt 1 ]; then
     PAD_ACTIVE="${DSV41_PAD_ACTIVE:-0}"
     [ "$PAD_ACTIVE" = 1 ] && MODEL_DIR="/model-tp${TP}"
   else
-    # Not fatal: a TP that divides the checkpoint needs no plan at all, and that
-    # is the common case. If padding really was needed, vLLM asserts in divide()
-    # at init with a clear message rather than serving something wrong.
-    printf '\033[33m! could not compute a padding plan for TP=%s:\n%s\n' "$TP" "$PAD_EVAL" >&2
-    printf '  continuing UNPADDED. Fine when TP divides this checkpoint; if it does\n' >&2
-    printf '  not, vLLM will assert in divide() during init.\033[0m\n' >&2
+    # No plan. Booting unpadded is only safe if the model actually divides TP —
+    # otherwise vLLM rejects it 10 minutes in ("Total number of attention heads
+    # (N) must be divisible by tensor parallel size (TP)"). Check the one key
+    # that decides it and refuse rather than warn.
+    heads="$(python3 -c "
+import json,sys
+cfg=json.load(open('$WEIGHTS/config.json'))
+for k in ('text_config','language_config','llm_config'):
+    if isinstance(cfg.get(k),dict) and 'num_attention_heads' in cfg[k]:
+        cfg=cfg[k]; break
+print(cfg.get('num_attention_heads',''))" 2>/dev/null)"
+    printf '\033[33m! could not compute a padding plan for TP=%s:\n%s\033[0m\n' "$TP" "$PAD_EVAL" >&2
+    if [ -z "$heads" ]; then
+      die "on top of that, num_attention_heads could not be read from
+   $WEIGHTS/config.json, so there is no way to tell whether TP=$TP is safe.
+   Refusing rather than booting unpadded. Start here:
+     python3 $PAD_SHIM_DIR/dsv41_tp_pad.py --tp $TP --model $WEIGHTS"
+    fi
+    if [ $((heads % TP)) -ne 0 ]; then
+      die "num_attention_heads=$heads does not divide TP=$TP and the padding plan
+   failed, so this would boot unpadded and vLLM would reject it at init with
+   'Total number of attention heads ($heads) must be divisible by tensor
+   parallel size ($TP)'. Fix the plan first:
+     python3 $PAD_SHIM_DIR/dsv41_tp_pad.py --tp $TP --model $WEIGHTS"
+    fi
+    printf '  continuing UNPADDED (num_attention_heads=%s divides TP=%s).\n' "$heads" "$TP" >&2
   fi
 fi
 
@@ -240,6 +260,12 @@ SERVE=(
   --default-chat-template-kwargs "{\"thinking\": $THINKING}"
   --distributed-executor-backend mp
 )
+# The published day-0 images need the tokenizer mode spelled out. On the overlay
+# images it auto-resolves to deepseek_v41 from model_type and their CLI choices
+# list does not even carry the literal, so passing it there would fail.
+case "$IMAGE" in
+  *deepseekv41-flash-0909*) SERVE+=(--tokenizer-mode deepseek_v41) ;;
+esac
 [ "$SPEC" = "dspark" ] && SERVE+=(--speculative-config \
   "{\"method\":\"dspark\",\"num_speculative_tokens\":$SPEC_K,\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":$SPEC_ADAPT}")
 [ "$TEXT_ONLY" = "1" ] && SERVE+=(--language-model-only) \

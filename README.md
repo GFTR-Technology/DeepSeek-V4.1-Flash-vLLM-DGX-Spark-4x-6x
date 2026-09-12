@@ -22,7 +22,11 @@ head; the workers only need this repo at the same path, the image, and the weigh
 ```bash
 cp scripts/cluster.env.example scripts/cluster.env   # IPs, user, fabric. One file.
 ./scripts/fetch-weights.sh nfs                       # 510 GB once, exported to the workers
-./scripts/build-image.sh && ./scripts/copy-image.sh  # overlay chain -> every node
+
+# the engine image — try the published one first, see "The engine image" below
+docker pull vllm/vllm-openai:deepseekv41-flash-0909-arm64
+# cluster.env:  IMAGE=vllm/vllm-openai:deepseekv41-flash-0909-arm64
+
 ./scripts/dsv41-serve.sh                             # serve. 300K lane.
 ```
 
@@ -50,7 +54,62 @@ head joins its rendezvous and hangs), drops the page cache, refuses to boot belo
 100 GiB of `MemAvailable`, and starts the workers headless before the head.
 
 **Node count is TP.** Four Sparks is the published, measured recipe. Six or eight
-also launch — see [any TP](#any-tp-4-6-8-) below.
+also launch — see [Any TP](#any-tp) below.
+
+## The engine image
+
+This repo was written on day 0, against vLLM's `dsv41-feat` branch, and every
+number on this page was measured on the image it builds, `vllm-dsv41:overlay5`.
+Since then the branch was **merged into mainline and deleted**, which changes what
+the build path costs you. Two options:
+
+| | published day-0 image | `vllm-dsv41:overlay5` |
+|---|---|---|
+| how | one `docker pull` | `./scripts/build-image.sh` |
+| sm_121a kernels for GB10 | **unknown — untested here** | yes, that is the point of it |
+| measured numbers on this page | no | yes |
+| cost if it does not work | one pull | — |
+
+Try the published one first; failing costs a pull.
+
+```bash
+# the tags are DATED — there is no bare `deepseekv41-flash` tag. List them:
+curl -s 'https://hub.docker.com/v2/repositories/vllm/vllm-openai/tags?page_size=100&name=deepseekv41' \
+  | python3 -c "import json,sys;[print(t['name']) for t in json.load(sys.stdin)['results']]"
+
+docker pull vllm/vllm-openai:deepseekv41-flash-0909-arm64    # DGX Spark is ARM64
+# cluster.env:  IMAGE=vllm/vllm-openai:deepseekv41-flash-0909-arm64
+```
+
+`dsv41-node-launch.sh` adds `--tokenizer-mode deepseek_v41` by itself for any
+`*deepseekv41-flash-0909*` image; the overlay images resolve it from `model_type`
+and reject the flag, so you do not have to think about it.
+
+If the engine dies in a kernel at load, that answers the unknown above and you
+need `overlay5`. `./scripts/build-image.sh --check` prints what is missing and how
+to get it; `--from overlay3` resumes after a failure. The parts that bite:
+
+- **overlay1 needs `build/vllm/`**, the branch's Python tree. The branch is gone,
+  so fetch the PR ref instead:
+  `git fetch origin pull/56214/head:dsv41-feat` (then `pull/56201/head` as a
+  fallback). `git ls-remote --heads https://github.com/vllm-project/vllm | grep -i dsv41`
+  confirms it really is gone.
+- **overlay1's base is pinned in `build/Dockerfile.overlay`**, not in
+  `cluster.env`. `HF_BASE_IMAGE` does not override it; the script reads the
+  `FROM` line and says so if the two disagree.
+- **`_C_stable_libtorch` is rebuilt inside a container**, `v41build`, whose
+  `/src` is the **full** vllm checkout (`CMakeLists.txt`, `cmake/`, `csrc/`) —
+  not the `vllm/` subdirectory. The branch's kernel changes all live in that one
+  extension, and the stock ARM64 wheels do not carry it for SM 12.1.
+- **`vllm/vllm-openai:*` are runtime images**: no cmake, no ninja, possibly no
+  nvcc. Check with
+  `docker exec v41build sh -c 'which cmake ninja g++ nvcc'`, add the first two
+  with `pip install cmake ninja`. No nvcc means that base cannot compile CUDA at
+  all — use a `-devel` CUDA base with a matching torch, or take the published
+  image.
+- **`--from-published`** tags a published image as `vllm-dsv41:overlay1` and
+  starts at overlay3, if you want FlashInfer 0.7.0rc1 and the prebuilt SM120
+  kernels on top of it without doing overlay1 yourself.
 
 ## Vision and tool calling (on in the serving config)
 
@@ -255,7 +314,7 @@ In boot order. Details in `docs/`.
     - `patch/engram.py` reads the copy only when its recorded row range covers the rank, and falls back to NFS otherwise. It is **on by default** and `scripts/dsv41-serve.sh` builds the copies itself on the first boot.
     - The same boot fixed `boot_dsv41.sh`, which was not forwarding the patch folder to each node (now `PATCH_NAME`).
 
-## Any TP (4, 6, 8, ...)
+## Any TP
 
 **TP is the node count**, and four Sparks is the only size this repo has measured.
 Six is the interesting case: the checkpoint's attention heads, output groups and
@@ -340,7 +399,7 @@ python3 tests/test_tp_pad.py --torch     # plan, overlay, shapes, numerics
 |---|---|
 | `scripts/` | **The launch path.** `cluster.env` (the one file you edit) + `lib.sh`, `dsv41-serve.sh` (`start\|stop\|status\|logs\|dry-run`), `dsv41-node-launch.sh` (per-rank `docker run`, workers first), `dsv41-container-entrypoint.sh` (RoCEv2 GID pick, TP config overlay), `engram-local.sh` (node-local Engram rows, run automatically by `serve`), `roce-check.sh`, `dsv41-tp-probe.sh`, `fetch-weights.sh`, `build-image.sh`, `copy-image.sh`. |
 | `patch/` | The exact files bind-mounted over vLLM (md5s in `patch/README.md`), plus one folder per fix with its diff and test. `dsv41_tp_pad/` is the TP padding shim (not bind-mounted over vLLM — it rides on `PYTHONPATH`). |
-| `build/` | Image chain: overlay1 (branch + sm121 extension), overlay3 (FlashInfer 0.7.0rc1), overlay4/5 (prebuilt kernels). |
+| `build/` | Image chain: overlay1 (the dsv41-feat tree + `_C_stable_libtorch` for sm121), overlay3 (FlashInfer 0.7.0rc1), overlay4/5 (prebuilt kernels). overlay1 needs a `vllm/` tree the repo cannot ship; `scripts/build-image.sh --check` explains how to get it now that the branch is gone. |
 | `launch/` | The original path, still working: `dsv41-tp4.sh <rank>`, `boot_dsv41.sh` (worker-first fan-out), one `bootN-go.sh` per boot. `boot10-go.sh` is the config every number here was measured on. |
 | `tools/` | Pre-launch steps, boot poll, post-serve checks, bench report, `engram_local.py` / `engram_ranges.py` (node-local Engram rows and their per-rank ranges), `gpuflip.py` / `flipsum.py` (GPU slow-state probe), `nccl_lat.py` (all-reduce check), `idletest.py` (per-step timing after idle vs back to back), `vision_tools_demo.py` (vision and tool-calling checks). |
 | `tests/` | `test_tp_pad.py`: the padding plan, the config overlay, and the padded shapes/numerics. |
@@ -359,7 +418,7 @@ is gitignored.
 **Sister repos:** [DeepSeek-V4-Flash-Vision-Exp (vLLM, 2x/4x Spark)](https://github.com/tonyd2wild/DeepSeek-v4-Flash-Vision-Exp-DSpark-1M-NVFP4-KV-2x-DGX-Spark) · [DeepSeek-V4-Flash-Vision (SGLang, 2x Spark)](https://github.com/tonyd2wild/DeepSeek-V4-Flash-Vision-SGLang-DGX-Spark)
 
 **Credits:**
-- The vLLM team, for the day-0 `dsv41-feat` branch.
+- The vLLM team, for the day-0 `dsv41-feat` branch (since merged into mainline and deleted; the day-0 images live on as dated `deepseekv41-flash-0909*` tags).
 - Kai, for the first Engram-on-disk patch and the SM12x page-size patches.
 - The Engram-on-disk idea follows our own PLE-on-disk patch for Qwen3.8-Flash-Next.
 - Prior art acknowledged at the idea level: vLLM PR #54129 (`VLLM_PLE_MMAP`). No code was copied.

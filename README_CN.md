@@ -19,7 +19,7 @@ cp scripts/cluster.env.example scripts/cluster.env   # IP、用户、网卡，�
 2. [填 cluster.env](#2-填-clusterenv)
 3. [每个节点克隆本仓库](#3-每个节点克隆本仓库)
 4. [下载权重并共享](#4-下载权重并共享)
-5. [构建镜像](#5-构建镜像)
+5. [引擎镜像](#5-引擎镜像)
 6. [双通道 RoCE 自检](#6-双通道-roce-自检)
 7. [启动](#7-启动)
 8. [档位（lane）](#8-档位lane)
@@ -58,7 +58,7 @@ cp scripts/cluster.env.example scripts/cluster.env   # IP、用户、网卡，�
 | `WEIGHTS` | head 上权重的本地路径 |
 | `WORKER_WEIGHTS` | worker 上看到同一份权重的路径（NFS 挂载点）。路径相同就删掉这行 |
 | `CACHE` | 编译缓存目录，默认 `/var/tmp/dsv41-vllm-cache` 即可 |
-| `IMAGE` | `build-image.sh` 之后的本地 tag，默认 `vllm-dsv41:overlay5` |
+| `IMAGE` | 引擎镜像。`build-image.sh` 产出的 `vllm-dsv41:overlay5`（实测数字都来自它），或官方 day-0 镜像 `vllm/vllm-openai:deepseekv41-flash-0909-arm64`（见[第 5 节](#5-引擎镜像)的保留意见） |
 | `ENGRAM_DISK` / `ENGRAM_LOCAL` | Engram 放磁盘（必须 1）/ 挂载节点本地行副本（**默认 1**，见[第 10 节](#10-节点本地-engram-行默认启用)） |
 
 在 Spark 上怎么找 fabric IP 和 HCA：
@@ -82,7 +82,7 @@ for ip in $WORKER_IPS; do ssh "$SSH_USER@$ip" hostname; done
 ## 3. 每个节点克隆本仓库
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark.git
 # 四台/六台都放同一路径，例如 ~/DeepSeek-V4.1-Flash-vLLM-DGX-Spark
 ```
 
@@ -125,42 +125,99 @@ sudo apt-get install -y nfs-common          # 每个 worker
 
 ---
 
-## 5. 构建镜像
+## 5. 引擎镜像
 
-镜像是**节点本地**的：要么每台都构建，要么在 head 构建后分发。
+镜像是**节点本地**的：每台都要有（在 head 构建/拉取后用 `copy-image.sh` 分发）。有两条路：
+
+| | 官方 day-0 镜像 | `vllm-dsv41:overlay5` |
+|---|---|---|
+| 怎么来 | 一条 `docker pull` | `./scripts/build-image.sh` |
+| GB10 的 sm_121a kernel | **未知，本仓库没验证过** | 有，这就是它存在的理由 |
+| 本文所有实测数字 | 不是在它上面测的 | 是 |
+| 不行的话损失 | 一次 pull | —— |
+
+**先试官方镜像**,失败也就损失一次 pull。
 
 ```bash
-./scripts/build-image.sh --check   # 先看缺什么，不动手
-./scripts/build-image.sh           # 构建整条 overlay 链，最终 tag 为 $IMAGE
-./scripts/copy-image.sh            # docker save + rsync + docker load 到每个 worker
+# tag 是带日期的,没有 deepseekv41-flash 这个裸 tag。先列出真实存在的:
+curl -s 'https://hub.docker.com/v2/repositories/vllm/vllm-openai/tags?page_size=100&name=deepseekv41' \
+  | python3 -c "import json,sys;[print(t['name']) for t in json.load(sys.stdin)['results']]"
+
+docker pull vllm/vllm-openai:deepseekv41-flash-0909-arm64   # DGX Spark 是 ARM64
+# 然后在 scripts/cluster.env 里:IMAGE=vllm/vllm-openai:deepseekv41-flash-0909-arm64
 ```
 
-> **这是整个仓库自动化程度最低的一步。** overlay3/4/5 是自洽的（所有 SHA 都钉死在
-> `build/build_overlay{3,4,5}.sh` 里），但 **overlay1 需要两样本仓库无法附带的东西**：
->
-> 1. `build/vllm/` —— vllm-project/vllm 分支 `dsv41-feat` 的 Python 目录树，
->    `Dockerfile.overlay` 会把它盖到基础镜像的 site-packages 上；
-> 2. 一个名为 `v41build`、`/src` 指向同一份 checkout 的运行中容器，
->    `build/build_stable_ext.sh` 在里面为 sm_121a 重编 `_C_stable_libtorch`。
->    分支的 kernel 改动全在这一个扩展里，官方 ARM64 wheel 不带 SM 12.1 的版本。
->
-> `--check` 会逐项告诉你缺哪个、怎么补，而不是让 docker 在 `COPY vllm/` 上报一句
-> `"/vllm": not found`。补齐后可以用 `--from overlay3` 之类从中间续跑，不用从头再来。
->
-> 想跳过 overlay1：`./scripts/build-image.sh --from-published` 会把官方 day-0 镜像
-> `vllm/vllm-openai:deepseekv41-flash-0909-arm64` 打上 `vllm-dsv41:overlay1` 的 tag
-> 再从 overlay3 往下走。那个镜像带分支代码，但**不带**为 sm_121a 重编的
-> `_C_stable_libtorch` —— 而那正是 overlay1 在 GB10 上存在的理由。这条路本仓库没验证过，
-> 如果加载时死在某个 kernel 里，就还是得老老实实做 overlay1。
+用官方镜像时 `dsv41-node-launch.sh` 会自动补 `--tokenizer-mode deepseek_v41`（凡是
+`*deepseekv41-flash-0909*` 的镜像都补）；overlay 镜像从 `model_type` 自己解析得出、
+反而不接受这个参数，所以也不会误加 —— 这块不用你操心。
 
-overlay 链解决的问题：
+加载时若死在某个 kernel 里，上面那个"未知"就有答案了，得回来构建 overlay5。
+
+### 构建 overlay 链
+
+```bash
+./scripts/build-image.sh --check   # 先看缺什么,不动手
+./scripts/build-image.sh           # 构建整条链,最终 tag 为 $IMAGE
+./scripts/build-image.sh --from overlay3   # 失败后从中间续跑
+./scripts/copy-image.sh            # docker save + rsync + docker load 到每个 worker
+```
 
 | 镜像 | 解决什么 |
 |---|---|
 | `overlay1` | vLLM `dsv41-feat` 分支的 kernel 改动全在 `_C_stable_libtorch` 里，为 sm_121a 重编 |
-| `overlay3` | FlashInfer 0.6.18 的 SM120 sparse-MLA decode 不支持 V4.1 的 topk=1152，换 0.7.0rc1 |
+| `overlay3` | FlashInfer 0.6.18 的 SM120 sparse-MLA decode 不支持 V4.1 的 topk=1152,换 0.7.0rc1 |
 | `overlay4` | `mxfp8_gemm_cutlass_sm120` 运行时编译（7 个 CUTLASS 文件、22 并发）曾把四台机器的主机内存同时耗尽 |
-| **`overlay5`** | 预编 `sparse_mla_sm120`，`verify5.py` 校验运行时零 JIT。**服务用的就是它** |
+| **`overlay5`** | 预编 `sparse_mla_sm120`,`verify5.py` 校验运行时零 JIT。**服务用的就是它** |
+
+**这是整个仓库自动化程度最低的一步。** overlay3/4/5 是自洽的（所有 SHA 都钉死在
+`build/build_overlay{3,4,5}.sh` 里）,卡人的全在 overlay1。四个坑，`--check` 会逐项
+点名并给出命令，而不是让 docker 在 `COPY vllm/` 上报一句 `"/vllm": not found`:
+
+**① `build/vllm/` —— 分支的 Python 树。** 分支已被删除，`git checkout dsv41-feat`
+会报"未匹配任何 git 已知文件",要走 PR 的 ref:
+
+```bash
+git clone https://github.com/vllm-project/vllm /src/vllm-dsv41
+git -C /src/vllm-dsv41 fetch origin pull/56214/head:dsv41-feat
+git -C /src/vllm-dsv41 checkout dsv41-feat
+cp -a /src/vllm-dsv41/vllm build/vllm
+```
+
+(PR #56214 是在 4×B200 TP4 上跑原始 MXFP4 checkpoint 用的那条；拉不到就换
+`pull/56201/head`。`git ls-remote --heads https://github.com/vllm-project/vllm | grep -i dsv41`
+可以确认分支确实没了。）
+
+**② base 镜像写死在 `build/Dockerfile.overlay` 的 `FROM` 里**,不是 `cluster.env`
+里的 `HF_BASE_IMAGE` —— 后者对 overlay1 无效。脚本直接读 `FROM` 那行，两者不一致时
+会明确提示，免得你去 pull 一个构建根本用不到的镜像。
+
+**③ `_C_stable_libtorch` 在容器里重编**,容器名 `v41build`,它的 `/src` 必须挂
+**完整 checkout**（要有 `CMakeLists.txt`、`cmake/`、`csrc/`),不是 `build/vllm`
+那个 Python 子目录：
+
+```bash
+docker run -d --name v41build --gpus all \
+  -v /src/vllm-dsv41:/src -w /src --entrypoint sleep \
+  <Dockerfile.overlay 里那个 FROM 镜像> infinity
+bash build/build_stable_ext.sh          # 最后要看到 BUILD OK
+docker exec v41build sh -c 'ls /src/build/_C_stable_libtorch*.so'
+docker cp v41build:/src/build/<上面列出的文件> build/vllm/
+```
+
+**④ `vllm/vllm-openai:*` 是运行时镜像**,不带 cmake/ninja,也可能不带 nvcc:
+
+```bash
+docker exec v41build sh -c 'which cmake ninja g++ nvcc'
+docker exec v41build pip install -q cmake ninja     # 缺 cmake/ninja 时
+```
+
+缺 nvcc 就说明这个 base 根本编不了 CUDA(`pip install cmake` 也救不回来）,得换
+`-devel` 的 CUDA 基础镜像（torch 版本要对得上）,或者回去用官方镜像。
+
+**想跳过 overlay1**:`./scripts/build-image.sh --from-published` 把官方 day-0 镜像
+打上 `vllm-dsv41:overlay1` 的 tag 再从 overlay3 往下走 —— 这样能拿到 FlashInfer
+0.7.0rc1 和预编的 SM120 kernel,但**不带**为 sm_121a 重编的 `_C_stable_libtorch`,
+保留意见同上。
 
 ---
 
@@ -354,6 +411,9 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 | 现象 | 原因 / 处理 |
 |---|---|
 | `Missing cluster.env.` | `cp scripts/cluster.env.example scripts/cluster.env` 后填 IP |
+| `docker pull ... deepseekv41-flash: not found` | 没有这个裸 tag。官方 tag 带日期和架构后缀，先用第 5 节那条 `curl` 列出真实 tag，DGX Spark 取 `-arm64` 的 |
+| `build_stable_ext.sh` 报 `cmake: command not found` / `CONFIGURE FAILED` | `v41build` 用的是运行时镜像，没有构建工具链。`docker exec v41build pip install -q cmake ninja`，并确认 `nvcc` 在（不在就换 `-devel` 基础镜像，或改用官方镜像） |
+| `路径规格 'dsv41-feat' 未匹配任何 git 已知文件` | 该分支已合进主线并被删除。用 `git fetch origin pull/56214/head:dsv41-feat` 取 PR ref，或干脆改用官方 day-0 镜像 `vllm/vllm-openai:deepseekv41-flash-0909-arm64` |
 | `failed to compute checksum of ref ... "/vllm": not found` | overlay1 的构建上下文里没有 `build/vllm/`（dsv41-feat 的 Python 树）。跑 `./scripts/build-image.sh --check` 看完整清单 |
 | `exportfs：找不到命令` / `exportfs: command not found` | head 上没装 NFS 服务端。`sudo apt-get install -y nfs-kernel-server`，或直接重跑 `./scripts/fetch-weights.sh nfs`（新版会自己装；权重已下好会跳过下载） |
 | worker 挂载报 `wrong fs type` | worker 上没装 `nfs-common`，同样由 `fetch-weights.sh nfs` 自动处理 |

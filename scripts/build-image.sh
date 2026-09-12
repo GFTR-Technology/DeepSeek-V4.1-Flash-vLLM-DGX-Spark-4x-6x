@@ -13,6 +13,9 @@
 #
 #   1. build/vllm/ — the Python tree of vllm-project/vllm branch `dsv41-feat`,
 #      which Dockerfile.overlay copies over the base image's site-packages.
+#      That branch is GONE upstream: V4.1 support was merged into mainline, so
+#      `git checkout dsv41-feat` fails now. Fetch the PR ref instead, or use
+#      --from-published, which starts from a published day-0 image.
 #   2. a running container named `v41build` with the same checkout at /src, in
 #      which build/build_stable_ext.sh rebuilds _C_stable_libtorch for sm_121a.
 #      The branch's kernel changes all live in that one extension, which the
@@ -30,8 +33,15 @@ BUILD_DIR="$REPO_ROOT/build"
 VLLM_TREE="${DSV41_VLLM_TREE:-$BUILD_DIR/vllm}"
 BUILD_CTR="${DSV41_BUILD_CONTAINER:-v41build}"
 PUBLISHED="${DSV41_PUBLISHED_IMAGE:-vllm/vllm-openai:deepseekv41-flash-0909-arm64}"
-# The exact merge-base of branch dsv41-feat; Dockerfile.overlay FROMs it.
-BASE_IMAGE="$HF_BASE_IMAGE"
+# overlay1's base is whatever Dockerfile.overlay says FROM, not cluster.env:
+# the Dockerfile pins the exact merge-base of the dsv41-feat branch, and that is
+# the image the build actually pulls. HF_BASE_IMAGE is only a fallback/hint.
+BASE_IMAGE="$(awk '/^[[:space:]]*FROM[[:space:]]/ {print $2; exit}' "$BUILD_DIR/Dockerfile.overlay" 2>/dev/null)"
+BASE_IMAGE="${BASE_IMAGE:-$HF_BASE_IMAGE}"
+if [ -n "${HF_BASE_IMAGE:-}" ] && [ "$HF_BASE_IMAGE" != "$BASE_IMAGE" ]; then
+  echo "note: cluster.env HF_BASE_IMAGE=$HF_BASE_IMAGE is ignored for overlay1;" >&2
+  echo "      Dockerfile.overlay pins FROM $BASE_IMAGE" >&2
+fi
 
 START=overlay1; CHECK_ONLY=0; FROM_PUBLISHED=0
 while [ $# -gt 0 ]; do
@@ -82,30 +92,47 @@ elif stage_ge overlay1; then
       echo "   sm121 extension   $(cd "$VLLM_TREE" && ls _C_stable_libtorch*.so)"
     else
       echo "   sm121 extension   MISSING from $VLLM_TREE"
-      echo "                     build it, then copy it in:"
-      echo "                       bash $BUILD_DIR/build_stable_ext.sh"
-      echo "                       docker cp $BUILD_CTR:/src/build/_C_stable_libtorch.<abi>.so $VLLM_TREE/"
+      echo "                     This is the last piece: _C_stable_libtorch.so rebuilt for"
+      echo "                     sm_121a. build_stable_ext.sh runs cmake INSIDE a container"
+      echo "                     named $BUILD_CTR whose /src is the FULL vllm checkout"
+      echo "                     (CMakeLists.txt, cmake/, csrc/) — not just the vllm/ dir."
+      echo "                       docker run -d --name $BUILD_CTR --gpus all \\"
+      echo "                         -v /src/vllm-dsv41:/src -w /src --entrypoint sleep \\"
+      echo "                         $BASE_IMAGE infinity"
+      echo "                     The vllm-openai images are RUNTIME images: they ship no"
+      echo "                     cmake/ninja, and may ship no nvcc. Check, then add the"
+      echo "                     toolchain:"
+      echo "                       docker exec $BUILD_CTR sh -c 'which cmake ninja g++ nvcc'"
+      echo "                       docker exec $BUILD_CTR pip install -q cmake ninja"
+      echo "                     If nvcc is missing this base cannot compile CUDA at all —"
+      echo "                     use a -devel CUDA base with a matching torch, or take the"
+      echo "                     --from-published route below."
+      echo "                       bash $BUILD_DIR/build_stable_ext.sh          # expect 'BUILD OK'"
+      echo "                       docker exec $BUILD_CTR sh -c 'ls /src/build/_C_stable_libtorch*.so'"
+      echo "                       docker cp $BUILD_CTR:/src/build/<that file> $VLLM_TREE/"
       miss=1
     fi
   else
     echo "   vllm tree         MISSING: $VLLM_TREE"
-    echo "                     Dockerfile.overlay copies it over site-packages. Get it with:"
+    echo "                     Dockerfile.overlay copies it over site-packages."
+    echo "                     NOTE: branch dsv41-feat no longer exists upstream —"
+    echo "                     V4.1 support was merged into mainline, so a plain"
+    echo "                     'git checkout dsv41-feat' now fails. Check with:"
+    echo "                       git ls-remote --heads https://github.com/vllm-project/vllm | grep -i dsv41"
+    echo "                     Get the day-0 tree from the PR ref instead:"
     echo "                       git clone https://github.com/vllm-project/vllm /src/vllm-dsv41"
+    echo "                       git -C /src/vllm-dsv41 fetch origin pull/56214/head:dsv41-feat"
     echo "                       git -C /src/vllm-dsv41 checkout dsv41-feat"
     echo "                       cp -a /src/vllm-dsv41/vllm $VLLM_TREE"
     echo "                     or point DSV41_VLLM_TREE at an existing checkout's vllm/ dir."
+    echo "                     Easier: --from-published (see below) — mainline now ships"
+    echo "                     an image with V4.1 support, so overlay1 may be unnecessary."
     miss=1
   fi
   if docker ps --format '{{.Names}}' | grep -qx "$BUILD_CTR"; then
     echo "   build container   $BUILD_CTR running"
   else
-    echo "   build container   NOT running: $BUILD_CTR"
-    echo "                     build_stable_ext.sh does 'docker exec $BUILD_CTR' with the"
-    echo "                     checkout at /src. Start one, e.g.:"
-    echo "                       docker run -d --name $BUILD_CTR --gpus all \\"
-    echo "                         -v /src/vllm-dsv41:/src -w /src --entrypoint sleep \\"
-    echo "                         $BASE_IMAGE infinity"
-    echo "                     (only needed to produce the .so above; skip if you already have it)"
+    echo "   build container   not running: $BUILD_CTR (only needed to produce the .so above)"
   fi
 fi
 
@@ -114,11 +141,18 @@ if [ "$miss" != 0 ]; then
   echo "== missing prerequisites above. Two ways forward:"
   echo "   1. supply them and re-run ./scripts/build-image.sh"
   echo "   2. ./scripts/build-image.sh --from-published"
-  echo "      tags $PUBLISHED"
-  echo "      as vllm-dsv41:overlay1 and starts at overlay3. That image carries the"
-  echo "      dsv41-feat branch but NOT _C_stable_libtorch rebuilt for sm_121a, which"
-  echo "      is the whole point of overlay1 on GB10. Untested here — if the engine"
-  echo "      dies in a kernel at load, you need the real overlay1."
+  echo "      tags a ready-made image as vllm-dsv41:overlay1 and starts at overlay3."
+  echo "      Default: $PUBLISHED"
+  echo "      Published tags are DATED — there is no bare deepseekv41-flash tag."
+  echo "      List what exists, then pick the -arm64 one:"
+  echo "        curl -s 'https://hub.docker.com/v2/repositories/vllm/vllm-openai/tags?page_size=100&name=deepseekv41' \\"
+  echo "          | python3 -c 'import json,sys;[print(t[\"name\"]) for t in json.load(sys.stdin)[\"results\"]]'"
+  echo "      or skip building altogether and point cluster.env at it:"
+  echo "        IMAGE=$PUBLISHED"
+  echo "      CAVEAT: this repo exists because the stock ARM64 wheels carried no"
+  echo "      sm_121a kernels for GB10 — that is what overlay1 rebuilds. Whether a"
+  echo "      published image covers SM 12.1 is untested here. If the engine dies in"
+  echo "      a kernel at load, you need the real overlay1."
   exit 1
 fi
 [ "$CHECK_ONLY" = 1 ] && { echo "== check only, nothing built"; exit 0; }

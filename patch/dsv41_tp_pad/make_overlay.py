@@ -58,7 +58,8 @@ def rewrite_config(config: dict, plan: pad.PadPlan) -> dict:
     # The plan was built from this same file, so a mismatch here means the source
     # moved under us between planning and overlay build.
     _expect(text, "num_attention_heads", d.heads, where)
-    _expect(text, "o_groups", d.groups, where)
+    if d.groups is not None:
+        _expect(text, "o_groups", d.groups, where)
 
     changes = []
 
@@ -68,7 +69,8 @@ def rewrite_config(config: dict, plan: pad.PadPlan) -> dict:
             container[key] = value
 
     if "attn" in plan.groups:
-        put(text, "o_groups", plan.o_groups, where)
+        if plan.o_groups is not None and d.groups is not None:
+            put(text, "o_groups", plan.o_groups, where)
         put(text, "num_attention_heads", plan.heads, where)
         # MLA ignores this, but leaving it at the old count next to a padded
         # head count is a trap for anyone reading the file later.
@@ -79,6 +81,14 @@ def rewrite_config(config: dict, plan: pad.PadPlan) -> dict:
     if "dense" in plan.groups and plan.intermediate != d.intermediate:
         put(text, "intermediate_size", plan.intermediate, where)
 
+    if not changes:
+        raise SystemExit(
+            "[dsv41-overlay] the plan says padding is needed but nothing in "
+            f"{CONFIG_NAME} changed. Serving this overlay would hit vLLM's own "
+            "divisibility check. Check that the keys live where _container() "
+            "looks for them."
+        )
+
     config["_dsv41_tp_pad"] = {
         "tp": plan.tp,
         "groups": sorted(plan.groups),
@@ -87,8 +97,6 @@ def rewrite_config(config: dict, plan: pad.PadPlan) -> dict:
     }
     for change in changes:
         print(f"[dsv41-overlay] {change}")
-    if not changes:
-        print("[dsv41-overlay] config already matches the plan; nothing changed")
     return config
 
 
