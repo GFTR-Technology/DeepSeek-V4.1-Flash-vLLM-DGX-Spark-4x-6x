@@ -5,7 +5,7 @@
 #   DSV41_LANE=1m   ./scripts/dsv41-serve.sh            # 1M context (eager)
 #   DSV41_LANE=128k ./scripts/dsv41-serve.sh
 #   DSV41_ENGRAM_LOCAL=1 ./scripts/dsv41-serve.sh       # node-local Engram rows
-#   ./scripts/dsv41-serve.sh stop|status|logs|dry-run
+#   ./scripts/dsv41-serve.sh stop|status|logs|logs-all|dry-run
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
@@ -37,6 +37,24 @@ case "${1:-start}" in
     docker logs -f "$NAME"
     exit 0
     ;;
+  logs-all)
+    # The head's traceback is usually a symptom: NCCL reports "remote process
+    # exited" while the real error sits in one worker's log. Dump them all.
+    n="${2:-40}"
+    for ip in "${NODES[@]}"; do
+      echo
+      echo "############ $ip (last $n lines) ############"
+      ssh_to "$ip" "docker logs --tail $n $NAME 2>&1" 2>/dev/null || echo "  unreachable / no container"
+    done
+    echo
+    echo "############ first error on each node ############"
+    for ip in "${NODES[@]}"; do
+      echo -n "$ip: "
+      ssh_to "$ip" "docker logs $NAME 2>&1 | grep -m1 -E 'FATAL|Error|error:|Traceback|SystemExit|Assertion'" 2>/dev/null \
+        || echo "(none found)"
+    done
+    exit 0
+    ;;
   dry-run)
     "$LAUNCH" --dry-run
     exit 0
@@ -44,7 +62,7 @@ case "${1:-start}" in
   start)
     ;;
   *)
-    echo "Usage: $0 {start|stop|status|logs|dry-run}"
+    echo "Usage: $0 {start|stop|status|logs|logs-all [N]|dry-run}"
     exit 1
     ;;
 esac
@@ -85,6 +103,26 @@ for ip in "${NODES[@]}"; do
     exit 1
   fi
 done
+
+# patch/ is bind-mounted from EACH node's own clone, so a half-synced fleet runs
+# different code per rank. That fails as "remote process exited" during NCCL
+# init on the head, with the real error buried in one worker's log. Compare the
+# checksums here instead.
+echo "[guard] patch set identical on every node"
+sum_cmd="cat \$(ls $PATCH_HOST/*.py $PATCH_HOST/mounts.txt $PATCH_HOST/dsv41_tp_pad/*.py 2>/dev/null | sort) | md5sum | cut -c1-12"
+head_sum="$(ssh_to "$HEAD_IP" "$sum_cmd" 2>/dev/null || bash -c "$sum_cmd")"
+mismatch=""
+for ip in "${NODES[@]}"; do
+  s="$(ssh_to "$ip" "$sum_cmd" 2>/dev/null)"
+  [ "$s" = "$head_sum" ] || mismatch="$mismatch $ip($s)"
+done
+if [ -n "$mismatch" ]; then
+  echo "Error: patch set differs from the head ($head_sum) on:$mismatch"
+  echo "       Every node bind-mounts its OWN copy, so they must match."
+  echo "       Sync the repo to all ${NNODES} nodes and re-run."
+  exit 1
+fi
+echo "        md5 $head_sum on all ${NNODES} nodes"
 
 # A TP that does not divide the attention heads / output groups / MoE
 # intermediate needs the padding shim bind-mounted on every rank, not just the
@@ -166,5 +204,5 @@ echo "Cold boot is ~12-20 min (10 min on the head, 10-18 over NFS on the workers
 echo "plus a second pass over all 48 shards for the DSpark draft layers)."
 echo "  Poll:    curl -s http://${HEAD_IP}:${PORT}/v1/models"
 echo "  Status:  $0 status"
-echo "  Logs:    $0 logs"
+echo "  Logs:    $0 logs        (head)   |   $0 logs-all   (every node)"
 echo "  Stop:    $0 stop"

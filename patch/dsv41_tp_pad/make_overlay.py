@@ -72,9 +72,11 @@ def rewrite_config(config: dict, plan: pad.PadPlan) -> dict:
         if plan.o_groups is not None and d.groups is not None:
             put(text, "o_groups", plan.o_groups, where)
         put(text, "num_attention_heads", plan.heads, where)
-        # MLA ignores this, but leaving it at the old count next to a padded
-        # head count is a trap for anyone reading the file later.
-        if "num_key_value_heads" in text:
+        # Only follow the head count when this config really means "one KV head
+        # per attention head". MLA keeps a single latent KV head
+        # (num_key_value_heads=1), vLLM sizes the KV cache from it, and 1 divides
+        # every TP — rewriting it would inflate the KV cache, not pad anything.
+        if text.get("num_key_value_heads") == d.heads:
             put(text, "num_key_value_heads", plan.heads, where)
     if "moe" in plan.groups and plan.moe_intermediate != d.moe_intermediate:
         put(text, "moe_intermediate_size", plan.moe_intermediate, where)

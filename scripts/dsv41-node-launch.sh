@@ -281,6 +281,10 @@ docker_run_cmd() {
     --gpus all --network host --ipc host --shm-size 32g
     --memory 112g --memory-swap 112g --oom-score-adj 500
     --cap-add IPC_LOCK --ulimit memlock=-1:-1
+    # NCCL opens a socket per peer per channel, and dual-rail doubles it. The
+    # daemon default (often 1024 soft) survives TP=4 and dies at TP=6 with
+    # "Call to socket failed: Too many open files" during ncclCommInitRank.
+    --ulimit "nofile=${DSV41_NOFILE:-65536}:${DSV41_NOFILE:-65536}"
     --device /dev/infiniband:/dev/infiniband
     -v "$weights:/model:ro"
     -v "$CACHE_HOST:/cache"

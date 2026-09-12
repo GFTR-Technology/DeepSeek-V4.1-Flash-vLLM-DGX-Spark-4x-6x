@@ -33,6 +33,7 @@ FAILED = []
 SOLO = {
     "num_attention_heads": 64, "o_groups": 64, "head_dim": 128,
     "o_lora_rank": 512, "intermediate_size": 18432, "moe_intermediate_size": 2048,
+    "num_key_value_heads": 1,   # MLA: one latent KV head, must survive padding
     "quantization_config": {"weight_block_size": [128, 128]},
 }
 # Four groups of 16 heads: padding has to add whole groups.
@@ -209,6 +210,8 @@ def test_overlay(m):
             check("moe_intermediate_size padded", cfg["moe_intermediate_size"], 2304)
             check("dense intermediate untouched", cfg["intermediate_size"], 18432)
             check("provenance recorded", cfg["_dsv41_tp_pad"]["tp"], 6)
+            check("MLA single latent KV head is NOT followed",
+                  cfg.get("num_key_value_heads"), 1)
             return
         with open(os.path.join(dst, "config.json"), encoding="utf-8") as f:
             cfg = json.load(f)
@@ -217,6 +220,8 @@ def test_overlay(m):
         check("moe_intermediate_size padded", cfg["moe_intermediate_size"], 2304)
         check("dense intermediate untouched", cfg["intermediate_size"], 18432)
         check("provenance recorded", cfg["_dsv41_tp_pad"]["tp"], 6)
+        check("MLA single latent KV head is NOT followed",
+              cfg.get("num_key_value_heads"), 1)
         check("shards symlinked, not copied",
               os.path.islink(os.path.join(dst, "model-00001-of-00002.safetensors")), True)
         check("config is a real file, not a link",
