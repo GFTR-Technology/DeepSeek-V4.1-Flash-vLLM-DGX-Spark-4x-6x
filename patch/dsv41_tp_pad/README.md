@@ -81,6 +81,16 @@ c10::Float8_e8m0fnu without overflow"*. Padded E8M0 rows are filled with **1.0**
 instead. That is inert: the scale multiplies the data row it belongs to, and that
 row was padded with zero.
 
+**A scale is recognised by a declared block ratio, nothing looser.** A rule sized
+for a weight also has to cover that weight's blockwise scale, which is the same
+extent divided by the quantization block. Accepting *any* small divisor is too
+loose: the 32-head sparse indexer's `wq_b` is `[4096, 1280]` against the main
+attention's 32768 — a ratio of 8 — and it is `ReplicatedLinear`, never sharded.
+Padding it produced *"Tried to load weights of size [6144, 1280] to a parameter of
+size [4096, 1280]"*. Only ratios listed in the checkpoint's
+`quantization_config.weight_block_size` are accepted now, so a ratio of 8 (or of
+256, for the indexer's own scale) is skipped.
+
 Rules key on the **module** (`.wq_b`), not the parameter, so `.wq_b.weight` and
 `.wq_b.weight_scale_inv` are padded consistently; each scale's block is inferred
 from the ratio of its size to the weight's. A per-tensor `input_scale` (size 1)

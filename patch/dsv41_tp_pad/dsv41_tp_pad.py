@@ -100,6 +100,10 @@ class Dims:
     intermediate: "int | None" = None
     vocab_size: "int | None" = None
     block: int = DEFAULT_BLOCK
+    #: every distinct quantization block the checkpoint declares. A tensor
+    #: may only be treated as a scale of another if their sizes differ by
+    #: exactly one of these.
+    blocks: tuple = (DEFAULT_BLOCK,)
 
     @property
     def heads_per_group(self) -> int:
@@ -116,7 +120,8 @@ def _flatten(raw: dict) -> dict:
     return flat
 
 
-def _quant_block(raw: dict) -> int:
+def _quant_blocks(raw: dict) -> tuple:
+    """Every distinct block size the checkpoint's quantization declares."""
     q = raw.get("quantization_config")
     sizes = []
     if isinstance(q, dict):
@@ -126,8 +131,7 @@ def _quant_block(raw: dict) -> int:
                 sizes.append(v)
             elif isinstance(v, (list, tuple)):
                 sizes += [x for x in v if isinstance(x, int) and x > 1]
-    # The coarsest block wins: a multiple of 128 is also a multiple of 64 and 32.
-    return max(sizes) if sizes else DEFAULT_BLOCK
+    return tuple(sorted(set(sizes))) if sizes else (DEFAULT_BLOCK,)
 
 
 def load_dims(model_dir: str) -> Dims:
@@ -159,7 +163,10 @@ def load_dims(model_dir: str) -> Dims:
         moe_intermediate=opt("moe_intermediate_size"),
         intermediate=opt("intermediate_size"),
         vocab_size=opt("vocab_size"),
-        block=_quant_block(raw),
+        # The coarsest block drives the lcm rounding; the whole set drives
+        # which size ratios may be read as "this is a scale of that".
+        block=max(_quant_blocks(raw)),
+        blocks=_quant_blocks(raw),
     )
 
 
@@ -396,7 +403,6 @@ def build_rules(plan: PadPlan) -> list[Rule]:
 # Padding
 # ---------------------------------------------------------------------------
 
-MAX_QUANT_BLOCK = 256
 
 
 def _pad_fill(rule: Rule, dtype, torch):
@@ -417,11 +423,17 @@ def _pad_fill(rule: Rule, dtype, torch):
     return fill
 
 
-def pad_tensor(tensor, rule: Rule):
+def pad_tensor(tensor, rule: Rule, blocks=(DEFAULT_BLOCK,)):
     """Zero-pad ``tensor`` along ``rule.dim`` if it is the size the rule expects.
 
-    A blockwise scale tensor is an exact integer fraction of the weight's extent;
-    the block is inferred from that ratio so scales need no rules of their own.
+    A blockwise scale tensor is the weight's extent divided by the quantization
+    block, so scales need no rules of their own. The divisor must be one the
+    checkpoint actually declares: accepting *any* small divisor matches unrelated
+    modules whose sizes happen to divide. The 32-head indexer's ``wq_b`` is
+    [4096, 1280] against the main attention's 32768 — a ratio of 8 — and it is
+    ReplicatedLinear, so padding it produced "Tried to load weights of size
+    [6144, 1280] to a parameter of size [4096, 1280]".
+
     Returns the tensor unchanged when the rule does not apply.
     """
     import torch
@@ -435,12 +447,12 @@ def pad_tensor(tensor, rule: Rule):
     elif (
         1 < have < src
         and src % have == 0
-        and src // have <= MAX_QUANT_BLOCK
+        and (src // have) in blocks
         and dst % (src // have) == 0
     ):
         block = src // have
     else:
-        # not this dimension, already padded, or a per-tensor scale (never grows)
+        # a different module, already padded, or a per-tensor scale (never grows)
         return tensor
     want = dst // block
     if want == have:
@@ -467,6 +479,7 @@ class Padder:
     def __init__(self, plan: PadPlan):
         self.plan = plan
         self.rules = build_rules(plan)
+        self.blocks = tuple(plan.dims.blocks)
         self.count = 0
         self.by_rule: dict[str, int] = {}
 
@@ -474,8 +487,11 @@ class Padder:
         for rule in self.rules:
             if not rule.pattern.search(name):
                 continue
-            padded = pad_tensor(tensor, rule)
+            padded = pad_tensor(tensor, rule, self.blocks)
             if padded is tensor:
+                if _debug():
+                    _log(f"skip {name} dim{rule.dim} size {tensor.shape[rule.dim]} "
+                         f"(rule {rule.what} expects {rule.old} or it / {self.blocks})")
                 continue
             self.count += 1
             self.by_rule[rule.what] = self.by_rule.get(rule.what, 0) + 1
@@ -669,7 +685,7 @@ def _main(argv: list[str] | None = None) -> int:
     print(f"  checkpoint: heads={d.heads} o_groups={d.groups} "
           f"head_dim={d.head_dim} o_lora_rank={d.o_lora_rank} "
           f"moe_intermediate={d.moe_intermediate} intermediate={d.intermediate} "
-          f"vocab={d.vocab_size} quant block={d.block}")
+          f"vocab={d.vocab_size} quant blocks={list(d.blocks)}")
     missing = [k for k, v in (("o_groups", d.groups), ("head_dim", d.head_dim),
                               ("vocab_size", d.vocab_size),
                               ("o_lora_rank", d.o_lora_rank),

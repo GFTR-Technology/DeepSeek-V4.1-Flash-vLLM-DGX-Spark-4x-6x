@@ -419,6 +419,7 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 | `failed to compute checksum of ref ... "/vllm": not found` | overlay1 的构建上下文里没有 `build/vllm/`（dsv41-feat 的 Python 树）。跑 `./scripts/build-image.sh --check` 看完整清单 |
 | `exportfs：找不到命令` / `exportfs: command not found` | head 上没装 NFS 服务端。`sudo apt-get install -y nfs-kernel-server`，或直接重跑 `./scripts/fetch-weights.sh nfs`（新版会自己装；权重已下好会跳过下载） |
 | worker 挂载报 `wrong fs type` | worker 上没装 `nfs-common`，同样由 `fetch-weights.sh nfs` 自动处理 |
+| `Tried to load weights of size [A] to a parameter of size [B]` | 某条补齐规则误伤了不该补的模块（典型：32 头的 indexer `wq_b`，它是 ReplicatedLinear 不分片）。现在只接受 `quantization_config.weight_block_size` 里声明的比例。`DSV41_TP_PAD_DEBUG=1` 可以打印每个被跳过的张量 |
 | `value cannot be converted to type c10::Float8_e8m0fnu without overflow` | E8M0 是纯指数格式，表示不了 0，补齐 MX scale 张量时要用 1.0（数据行已经是 0，scale 取什么都不影响）。确认 `dsv41_tp_pad.py` 是最新的 |
 | `AssertionError: 129280 is not divisible by 6` | 词表取整单位问题，见第 9 节的 `vocab` 组。确认各节点的 `patch/dsv41_tp_pad/` 已是最新 |
 | `Call to socket failed: Too many open files` | 容器 `nofile` 上限太低，启动器已设 `--ulimit nofile=65536`（`DSV41_NOFILE` 可调）。docker daemon 拒绝的话查 `systemctl show docker | grep -i limitnofile` |

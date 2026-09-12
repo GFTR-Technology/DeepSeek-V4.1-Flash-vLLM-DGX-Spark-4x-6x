@@ -36,6 +36,7 @@ SOLO = {
     "num_key_value_heads": 1,   # MLA: one latent KV head, must survive padding
     "vocab_size": 129280,       # 64 x 2020: padded for 64, not for 6
     "quantization_config": {"weight_block_size": [128, 128]},
+    # -> blocks == (128,): only a /128 ratio may be read as "this is a scale"
 }
 # Four groups of 16 heads: padding has to add whole groups.
 GROUPED = dict(SOLO, o_groups=4)
@@ -206,6 +207,41 @@ def test_plan(m):
     for name in ("model.layers.0.self_attn.wq_b_proj.weight",
                  "model.layers.0.mlp.gate.weight"):
         check(f"does not match {name.rsplit('.', 2)[-2]}", bool(wq.pattern.search(name)), False)
+
+    print("plan: only a declared quantization block counts as a scale ratio")
+    with tempfile.TemporaryDirectory() as tmp:
+        d_blk = m.load_dims(write_model(tmp, SOLO))
+    check("blocks read from config", d_blk.blocks, (128,))
+    with tempfile.TemporaryDirectory() as tmp:
+        d_multi = m.load_dims(write_model(tmp, dict(
+            SOLO, quantization_config={"weight_block_size": [1, 32]})))
+    check("1 is not a block, 32 is", d_multi.blocks, (32,))
+    check("coarsest drives the lcm rounding", d_multi.block, 32)
+
+    rule = m.Rule("attn", "wq_b out", m._rx(".wq_b"), 0, 32768, 49152, m.ZERO)
+
+    class _T:
+        def __init__(self, *sh): self.shape = tuple(sh)
+        def dim(self): return len(self.shape)
+        dtype = "bf16"; device = "cpu"
+
+    def _accepts(size, blocks):
+        """Would pad_tensor act on a tensor of this size? (shape math only)"""
+        have, src, dst = size, rule.old, rule.new
+        if have == src:
+            return True
+        return (1 < have < src and src % have == 0
+                and (src // have) in blocks and dst % (src // have) == 0)
+
+    check("exact weight size matches", _accepts(32768, (32,)), True)
+    check("scale at the declared block matches", _accepts(32768 // 32, (32,)), True)
+    # the 32-head indexer's wq_b is 4096 = 32768/8. 8 is not a block, and that
+    # module is ReplicatedLinear, so padding it produced
+    # "Tried to load weights of size [6144, 1280] to a parameter of size [4096, 1280]"
+    check("indexer wq_b (ratio 8) is NOT matched", _accepts(4096, (32,)), False)
+    check("indexer wq_b scale (ratio 256) is NOT matched", _accepts(128, (32,)), False)
+    check("a ratio that IS a block but from another module still matches (known limit)",
+          _accepts(32768 // 32, (32,)), True)
 
     print("plan: padded slices use a fill the dtype can actually hold")
     import types as _types
