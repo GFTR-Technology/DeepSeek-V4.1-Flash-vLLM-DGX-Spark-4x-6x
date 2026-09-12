@@ -399,6 +399,24 @@ def build_rules(plan: PadPlan) -> list[Rule]:
 MAX_QUANT_BLOCK = 256
 
 
+def _pad_fill(rule: Rule, dtype, torch):
+    """The value to fill a padded slice with, adjusted for the tensor's dtype.
+
+    E8M0 (the MX scale format) stores a bare exponent: it can represent neither
+    0 nor -inf, and ``torch.full(..., 0.0, dtype=float8_e8m0fnu)`` raises
+    "value cannot be converted to type c10::Float8_e8m0fnu without overflow".
+    A padded *scale* row is multiplied by a padded *data* row, which is zero, so
+    the scale itself is arithmetically irrelevant — use 1.0, the one value that
+    is always representable and never introduces an inf or NaN.
+    """
+    fill = float("-inf") if rule.mode is NEG_INF else 0.0
+    for name in ("float8_e8m0fnu", "float8_e8m0"):
+        dt = getattr(torch, name, None)
+        if dt is not None and dtype == dt:
+            return 1.0
+    return fill
+
+
 def pad_tensor(tensor, rule: Rule):
     """Zero-pad ``tensor`` along ``rule.dim`` if it is the size the rule expects.
 
@@ -429,8 +447,17 @@ def pad_tensor(tensor, rule: Rule):
         return tensor
     shape = list(tensor.shape)
     shape[dim] = want - have
-    fill = float("-inf") if rule.mode is NEG_INF else 0.0
-    tail = torch.full(shape, fill, dtype=tensor.dtype, device=tensor.device)
+    fill = _pad_fill(rule, tensor.dtype, torch)
+    try:
+        tail = torch.full(shape, fill, dtype=tensor.dtype, device=tensor.device)
+    except RuntimeError as exc:
+        # A dtype that cannot hold `fill` at all. 1.0 is representable in every
+        # float format vLLM uses here; the data rows it pairs with are zero.
+        if fill == 1.0:
+            raise RuntimeError(
+                f"{LOG_PREFIX} cannot build padding for dtype {tensor.dtype}: {exc}"
+            ) from exc
+        tail = torch.full(shape, 1.0, dtype=tensor.dtype, device=tensor.device)
     return torch.cat([tensor, tail], dim=dim)
 
 

@@ -74,6 +74,13 @@ multiplied by `head_dim` / `o_lora_rank`, which are already multiples of the
 block. `_validate()` asserts the per-rank shard is still a whole number of blocks
 and refuses the plan otherwise.
 
+**A padded scale cannot be filled with zero.** MX scales are stored as E8M0, a
+bare exponent: the format has no zero and no -inf, and `torch.full(..., 0.0,
+dtype=float8_e8m0fnu)` raises *"value cannot be converted to type
+c10::Float8_e8m0fnu without overflow"*. Padded E8M0 rows are filled with **1.0**
+instead. That is inert: the scale multiplies the data row it belongs to, and that
+row was padded with zero.
+
 Rules key on the **module** (`.wq_b`), not the parameter, so `.wq_b.weight` and
 `.wq_b.weight_scale_inv` are padded consistently; each scale's block is inferred
 from the ratio of its size to the weight's. A per-tensor `input_scale` (size 1)

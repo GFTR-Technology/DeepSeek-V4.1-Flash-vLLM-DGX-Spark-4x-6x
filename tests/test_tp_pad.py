@@ -207,6 +207,32 @@ def test_plan(m):
                  "model.layers.0.mlp.gate.weight"):
         check(f"does not match {name.rsplit('.', 2)[-2]}", bool(wq.pattern.search(name)), False)
 
+    print("plan: padded slices use a fill the dtype can actually hold")
+    import types as _types
+
+    class _DT:
+        def __init__(self, n): self.n = n
+        def __eq__(self, o): return isinstance(o, _DT) and self.n == o.n
+        def __repr__(self): return f"torch.{self.n}"
+
+    _torch = _types.SimpleNamespace(float8_e8m0fnu=_DT("float8_e8m0fnu"),
+                                    float8_e4m3fn=_DT("float8_e4m3fn"),
+                                    bfloat16=_DT("bfloat16"))
+    zero_rule = m.Rule("attn", "wq_b out", m._rx(".wq_b"), 0, 8192, 12288, m.ZERO)
+    sink_rule = m.Rule("attn", "attn sink", m._rx(".attn_sink"), 0, 64, 96, m.NEG_INF)
+    check("bf16 weight -> 0.0",
+          m._pad_fill(zero_rule, _torch.bfloat16, _torch), 0.0)
+    check("fp8 e4m3 weight -> 0.0",
+          m._pad_fill(zero_rule, _torch.float8_e4m3fn, _torch), 0.0)
+    # E8M0 is exponent-only: no zero, no -inf. A padded scale pairs with a padded
+    # (zero) data row, so 1.0 is inert and always representable.
+    check("E8M0 scale -> 1.0, not 0.0",
+          m._pad_fill(zero_rule, _torch.float8_e8m0fnu, _torch), 1.0)
+    check("bf16 attn_sink -> -inf",
+          m._pad_fill(sink_rule, _torch.bfloat16, _torch), float("-inf"))
+    check("E8M0 never gets -inf either",
+          m._pad_fill(sink_rule, _torch.float8_e8m0fnu, _torch), 1.0)
+
     print("plan: CLI --shell is what the launcher eval()s")
     with tempfile.TemporaryDirectory() as tmp:
         d6 = write_model(tmp, SOLO)
