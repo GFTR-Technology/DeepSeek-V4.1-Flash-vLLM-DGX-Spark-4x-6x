@@ -470,6 +470,18 @@ def test_experts(m):
     check("the two rules do not overlap",
           bool(w.pattern.search("model.mtp.0.ffn.gate.bias")), False)
 
+    print("experts: an expert-indexed tensor is caught by shape, not by name")
+    # The named rules have to guess the router module's name. The first cluster
+    # boot died because that guess was wrong: "Attempted to load weight
+    # (torch.Size([128])) into parameter (torch.Size([132]))". The fallback keys
+    # on the dim-0 extent inside a draft block instead.
+    rx = m._DRAFT_PREFIX_RX
+    for name in ("mtp.0.ffn.gate.bias", "mtp.0.ffn.router_bias",
+                 "model.dspark.0.ffn.whatever_they_called_it"):
+        check(f"draft-scoped: {name}", bool(rx.search(name)), True)
+    for name in ("model.layers.0.ffn.gate.bias", "model.embed_tokens.weight"):
+        check(f"NOT draft-scoped: {name}", bool(rx.search(name)), False)
+
     print("experts: the overlay advertises the padded draft count")
     # rewrite_config directly: build()'s symlink half needs a privilege Windows
     # withholds, and the logic under test is entirely in the rewrite.

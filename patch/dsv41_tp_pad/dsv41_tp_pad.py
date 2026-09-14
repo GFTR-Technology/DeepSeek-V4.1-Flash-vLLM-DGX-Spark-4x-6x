@@ -498,6 +498,7 @@ def _rx(tail: str) -> "re.Pattern":
 
 #: the module path of a speculative draft block: `mtp.0.ffn`, `draft.1.mlp`, ...
 _DRAFT_PREFIX = r"(^|\.)(mtp|dspark|draft|eagle)\.?\d*\."
+_DRAFT_PREFIX_RX = re.compile(_DRAFT_PREFIX)
 #: its router. Split by parameter because the two halves take different fill:
 #: a dead expert's logit row is zero, its bias is what actually excludes it.
 _DRAFT_GATE_W = re.compile(_DRAFT_PREFIX + r".*\b(gate|router)\.(weight|qweight)$")
@@ -655,6 +656,53 @@ class Padder:
                 _log(f"{name} dim{rule.dim} {tensor.shape[rule.dim]} -> "
                      f"{padded.shape[rule.dim]} [{rule.what}]")
             tensor = padded
+        return self._expert_indexed(name, tensor)
+
+    def _expert_indexed(self, name: str, tensor):
+        """Catch any draft tensor indexed by expert that the rules missed.
+
+        The named rules above have to guess what the router module is called
+        (`gate`, `router`, ...). Getting that wrong is not hypothetical: the
+        first cluster boot with a padded draft died on
+        "Attempted to load weight (torch.Size([128])) into parameter
+        (torch.Size([132]))" -- vLLM had built the parameter at the padded count
+        from the overlay config, but the checkpoint tensor came through
+        unpadded because no pattern matched its name.
+
+        So key on the shape instead of the name: inside a draft block, a dim-0
+        extent that is exactly the draft's expert count IS the expert axis.
+        Nothing else in these blocks is 128 wide -- hidden is 7168, head_dim
+        512, moe_intermediate 2304 -- and a false positive cannot pass silently,
+        because the parameter it is loaded into would then have the wrong size
+        and assert exactly as above.
+
+        `.experts.<id>.` tensors are excluded: there the expert is in the *name*
+        and dim 0 is an intermediate width.
+        """
+        pads = self.plan.expert_pads
+        if not pads or not tensor.dim():
+            return tensor
+        if ".experts." in name or not _DRAFT_PREFIX_RX.search(name):
+            return tensor
+        for _key, old, new in pads:
+            if tensor.shape[0] != old:
+                continue
+            # 1-D is a per-expert score or bias: it has to be pushed out of
+            # top-k, not zeroed -- a zero bias competes with real logits.
+            # 2-D is the router's logit rows, where zero contributes nothing.
+            mode = NEG_BIG if tensor.dim() == 1 else ZERO
+            rule = Rule("experts", "draft expert axis", _DRAFT_PREFIX_RX,
+                        0, old, new, mode)
+            padded = pad_tensor(tensor, rule, self.blocks)
+            if padded is not tensor:
+                self.count += 1
+                self.by_rule["draft expert axis"] = \
+                    self.by_rule.get("draft expert axis", 0) + 1
+                _log(f"{name} dim0 {old} -> {new} [draft expert axis, "
+                     f"{'excluded from top-k' if mode is NEG_BIG else 'zeroed'}]")
+                return padded
+        if _debug():
+            _log(f"draft tensor left alone: {name} {tuple(tensor.shape)}")
         return tensor
 
     def report(self) -> str:
