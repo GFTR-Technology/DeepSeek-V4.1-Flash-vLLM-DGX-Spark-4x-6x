@@ -115,6 +115,40 @@ rows have not moved.
 `lcm(64, tp)` is 64 whenever tp divides 64, so at TP=4 or TP=8 this group is a
 no-op. That is why it never surfaced until TP=6.
 
+## Expert counts: the draft is padded, the backbone is not
+
+Experts shard by **count**, so the count has to divide TP. This checkpoint has
+two of them (`tools/inspect_experts.py`):
+
+| where | blocks | experts | 384 or 128 mod 6 |
+|---|---|---|---|
+| backbone `layers.0..39.ffn` | 40 | 384 | 0 — already fine |
+| DSpark draft `mtp.0..2.ffn` | 3 | 128 | 2 — needs +4 |
+
+vLLM's own remedy, `num_redundant_experts`, cannot fix this: it is a single
+global number added to every MoE, and no `r` satisfies `384 + r ≡ 0` and
+`128 + r ≡ 0 (mod 6)` at once. That is the dead end the cluster kept hitting as
+`n_physical_experts=388 must be divisible by tp_size=6`.
+
+So the plan pads the **draft's count instead**, 128 → 132, and leaves the
+backbone alone. Two things make a dead expert harmless there:
+
+- Each block carries a `gate.bias`, one entry per expert, added to the routing
+  score. A dead expert's entry is set to `NEG_BIG` (−1e4, not −inf: `0 * -inf`
+  is a NaN, and real logits sit within about ±20), which keeps it out of top-k.
+- Even if one were selected, this is a *speculative draft* — every token it
+  proposes is verified against the real model before it is emitted. The cost
+  would be acceptance rate, i.e. speed, never correctness.
+
+Neither argument holds for the backbone, so a backbone count that does not
+divide TP is still refused with the `num_redundant_experts` advice.
+
+Unlike every other rule here, this one has to **create** tensors: ids 128..131
+do not exist in the checkpoint, and vLLM's fused-MoE loader fills its expert
+slots one id at a time, so a slot nobody loads keeps whatever `torch.empty` left
+in it. `Padder.extra` emits explicit zero experts (1.0 for e8m0 scales, which
+cannot represent 0) keyed on expert 0 of each draft block.
+
 ## Engram is not padded
 
 The Engram tables are split by hash column, and

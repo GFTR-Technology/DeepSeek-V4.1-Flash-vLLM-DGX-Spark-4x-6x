@@ -408,10 +408,90 @@ def test_torch(m):
     assert rules  # referenced for clarity above
 
 
+# The real checkpoint: backbone 384 experts x 40 blocks, DSpark draft 128 x 3,
+# each block carrying its own gate.weight AND gate.bias. At tp=6 only the 128
+# fails to divide -- 384 / 6 = 64 exactly.
+EXPERTS = dict(
+    SOLO,
+    text_config={
+        "num_attention_heads": 64, "o_groups": 64, "head_dim": 128,
+        "n_routed_experts": 384,
+        "dspark_n_routed_experts": 128,
+    },
+)
+
+
+def test_experts(m):
+    print("experts: the draft's count is padded, the backbone's is not")
+    with tempfile.TemporaryDirectory() as tmp:
+        d = m.load_dims(write_model(tmp, EXPERTS))
+    check("both counts read",
+          sorted(v for _, v in d.expert_counts), [128, 384])
+
+    p6 = m.plan_for_tp(d, 6)
+    check("draft 128 -> 132",
+          p6.expert_pads, (("text_config.dspark_n_routed_experts", 128, 132),))
+    check("132 shards evenly over 6", 132 % 6, 0)
+    check("backbone 384 needed nothing", 384 % 6, 0)
+    # This is the assertion the cluster hit:
+    # "n_physical_experts=128 must be divisible by tp_size=6".
+    check("no longer refused by the expert guard", p6.expert_advice("dspark"), None)
+
+    print("experts: tp=4 divides both, so nothing is padded")
+    check("no pads at tp=4", m.plan_for_tp(d, 4).expert_pads, ())
+
+    print("experts: a backbone count that does not divide is STILL refused")
+    odd = dict(EXPERTS, text_config=dict(EXPERTS["text_config"],
+                                         n_routed_experts=386))
+    with tempfile.TemporaryDirectory() as tmp:
+        do = m.load_dims(write_model(tmp, odd))
+    advice = m.plan_for_tp(do, 6).expert_advice("dspark")
+    check("backbone 386 reported", bool(advice and "386" in advice), True)
+    check("draft not reported (it is padded now)",
+          "dspark_n_routed_experts" in (advice or ""), False)
+
+    print("experts: the router rules cannot touch the backbone's 384-wide gate")
+    rules = {r.what: r for r in m.build_rules(p6)}
+    w = rules.get("draft router logits")
+    b = rules.get("draft router bias")
+    check("logit rows zero-filled 128 -> 132",
+          (w.old, w.new, w.mode), (128, 132, m.ZERO))
+    check("bias entries pushed out of top-k",
+          (b.old, b.new, b.mode), (128, 132, m.NEG_BIG))
+    check("bias is finite (-inf would risk 0 * -inf = NaN)",
+          m.NEG_BIG_VALUE < -1000 and m.NEG_BIG_VALUE == m.NEG_BIG_VALUE, True)
+    for name in ("model.layers.0.ffn.gate.weight", "model.layers.7.ffn.gate.bias"):
+        check(f"backbone {name.rsplit('.', 2)[-2]}.{name.rsplit('.', 1)[-1]} untouched",
+              bool(w.pattern.search(name) or b.pattern.search(name)), False)
+    check("draft gate.weight matched by the logit rule",
+          bool(w.pattern.search("model.mtp.0.ffn.gate.weight")), True)
+    check("draft gate.bias matched by the bias rule",
+          bool(b.pattern.search("model.mtp.2.ffn.gate.bias")), True)
+    check("the two rules do not overlap",
+          bool(w.pattern.search("model.mtp.0.ffn.gate.bias")), False)
+
+    print("experts: the overlay advertises the padded draft count")
+    # rewrite_config directly: build()'s symlink half needs a privilege Windows
+    # withholds, and the logic under test is entirely in the rewrite.
+    spec = importlib.util.spec_from_file_location(
+        "make_overlay", os.path.join(SHIM_DIR, "make_overlay.py"))
+    ov = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ov)
+    cfg = ov.rewrite_config(json.loads(json.dumps(EXPERTS)), p6)
+    check("draft count rewritten",
+          cfg["text_config"]["dspark_n_routed_experts"], 132)
+    check("backbone count left alone",
+          cfg["text_config"]["n_routed_experts"], 384)
+    check("the rewrite is recorded for the log",
+          any("dspark_n_routed_experts" in c
+              for c in cfg["_dsv41_tp_pad"]["changes"]), True)
+
+
 if __name__ == "__main__":
     mod = load_shim()
     test_plan(mod)
     test_overlay(mod)
+    test_experts(mod)
     if "--torch" in sys.argv:
         test_torch(mod)
     else:

@@ -51,6 +51,18 @@ def _expect(container: dict, key: str, want: int, where: str) -> None:
         )
 
 
+def _walk(config: dict, path: str) -> tuple[dict, str]:
+    """Resolve a dotted path to (containing dict, final key)."""
+    parts = path.split(".")
+    node = config
+    for part in parts[:-1]:
+        node = node.get(part)
+        if not isinstance(node, dict):
+            raise SystemExit(f"[dsv41-overlay] {CONFIG_NAME} has no section {part!r} "
+                             f"on the way to {path}")
+    return node, parts[-1]
+
+
 def rewrite_config(config: dict, plan: pad.PadPlan) -> dict:
     text, where = _container(config)
     d = plan.dims
@@ -82,6 +94,18 @@ def rewrite_config(config: dict, plan: pad.PadPlan) -> dict:
         put(text, "moe_intermediate_size", plan.moe_intermediate, where)
     if "dense" in plan.groups and plan.intermediate != d.intermediate:
         put(text, "intermediate_size", plan.intermediate, where)
+    # The draft's expert count. _expert_counts records the full dotted path it
+    # was found at, because these keys nest (text_config.dspark_n_routed_experts)
+    # and the backbone's own count sits right beside it under a different name.
+    for path, old, new in plan.expert_pads:
+        holder, leaf = _walk(config, path)
+        if holder.get(leaf) != old:
+            raise SystemExit(
+                f"[dsv41-overlay] {path} is {holder.get(leaf)!r}, expected {old!r}. "
+                "The plan and the config disagree — re-read the source "
+                "config.json before padding anything."
+            )
+        put(holder, leaf, new, path.rsplit(".", 1)[0] if "." in path else "top level")
 
     if not changes:
         raise SystemExit(

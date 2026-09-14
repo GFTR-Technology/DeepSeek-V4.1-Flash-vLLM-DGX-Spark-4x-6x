@@ -64,8 +64,8 @@ LOG_PREFIX = "[dsv41-tp-pad]"
 # fractional number of rows, which cannot be expressed at all.
 DEFAULT_BLOCK = 128
 
-ALL_GROUPS = ("attn", "moe", "dense", "vocab")
-DEFAULT_GROUPS = ("attn", "moe", "dense", "vocab")
+ALL_GROUPS = ("attn", "moe", "dense", "vocab", "experts")
+DEFAULT_GROUPS = ("attn", "moe", "dense", "vocab", "experts")
 
 # vLLM already rounds the vocab up to a multiple of this before sharding it
 # (DEFAULT_VOCAB_PADDING_SIZE). The real value is read from the module at
@@ -146,6 +146,35 @@ _EXPERT_KEY = re.compile(r"(^|_)(n_routed_experts|num_experts|n_experts"
                          r"|n_physical_experts|num_local_experts)$")
 
 
+def _draft_expert_pads(dims: "Dims", tp: int) -> tuple:
+    """Expert counts we may grow by adding dead experts — the draft's only.
+
+    An expert count is sharded by count, so it has to divide tp, and vLLM's own
+    remedy (``num_redundant_experts``) is a single global number: it cannot fix a
+    backbone at 384 and a draft at 128 at once, because 384 already divides 6 and
+    128 needs +4. Growing the *draft* to 132 fixes it without touching either.
+
+    Padding an expert count is only safe where a picked dummy cannot change the
+    answer, and the draft is exactly that place:
+
+    * The checkpoint has a per-block ``gate.bias`` (one entry per expert, added
+      to the routing score), so a dummy expert can be pushed out of top-k
+      outright rather than merely scoring zero.
+    * Even if a dummy were somehow selected, its weights are zero, and this is a
+      *speculative draft*: every token it proposes is verified against the real
+      model before it is emitted. The cost would be acceptance rate, i.e. speed.
+
+    Neither argument transfers to the backbone, so backbone counts are never
+    padded here — they fall through to ``expert_advice``.
+    """
+    pads = []
+    for key, count in dims.expert_counts:
+        if count % tp == 0 or not _DRAFT_EXPERT_KEY.search(key):
+            continue
+        pads.append((key, count, _round_up(count, tp)))
+    return tuple(pads)
+
+
 def _expert_counts(raw: dict, _path: str = "") -> tuple:
     """Walk the whole config for expert counts, nested sections included.
 
@@ -218,6 +247,16 @@ class PadPlan:
     moe_intermediate: int
     intermediate: int
     vocab_pad_to: int = VOCAB_PAD_BASE
+    #: ``(config path, old count, padded count)`` per expert count this plan
+    #: grows. Only ever the speculative draft's — see ``_draft_expert_pads``.
+    expert_pads: tuple = ()
+
+    def expert_pad_for(self, count: int) -> "tuple | None":
+        """The pad entry whose *old* count is ``count``, if any."""
+        for key, old, new in self.expert_pads:
+            if old == count:
+                return (key, old, new)
+        return None
 
     @property
     def vocab_padded(self) -> "int | None":
@@ -227,19 +266,23 @@ class PadPlan:
         return _round_up(self.dims.vocab_size, self.vocab_pad_to)
 
     def expert_advice(self, spec: str = "dspark") -> "str | None":
-        """Experts are sharded by count, and a dummy expert is not inert.
+        """Expert counts that do not divide tp and that this plan cannot fix.
 
-        The router computes its logits as ``x @ w_router.T``: a zero row scores
-        0.0 and top-k can pick it, so padding the expert count would change the
-        output. vLLM's own remedy is ``num_redundant_experts`` — replicas of real
-        experts — which is what its assertion message points at. This is only
-        advice; nothing here can fix it.
+        Experts shard by count. Where a dummy expert can be made harmless the
+        plan pads the count itself (``_draft_expert_pads``) and nothing is
+        reported here. What is left is the backbone, where a dummy is NOT safe:
+        even with a ``gate.bias`` to push it out of top-k, a wrong routing
+        decision would change the answer with nothing downstream to catch it.
+        vLLM's own remedy for those is ``num_redundant_experts`` — replicas of
+        real experts — which is what its assertion message points at. This is
+        only advice; nothing here can fix it.
 
         ``spec`` is the speculative method in force. With it off, draft-only
         counts are dropped -- otherwise this would block the very command it
         recommends.
         """
-        bad = [(k, v) for k, v in self.dims.expert_counts if v % self.tp]
+        bad = [(k, v) for k, v in self.dims.expert_counts
+               if v % self.tp and not self.expert_pad_for(v)]
         if spec in ("", "none", "off", "0"):
             bad = [(k, v) for k, v in bad if not _DRAFT_EXPERT_KEY.search(k)]
         if not bad:
@@ -248,12 +291,13 @@ class PadPlan:
         # single r works only if every count needs the same residue.
         relevant = [(k, v) for k, v in self.dims.expert_counts
                     if not (spec in ("", "none", "off", "0")
-                            and _DRAFT_EXPERT_KEY.search(k))]
+                            and _DRAFT_EXPERT_KEY.search(k))
+                    and not self.expert_pad_for(v)]
         bits = ", ".join(f"{k}={v} (needs +{(-v) % self.tp})" for k, v in bad)
         needs = {(-v) % self.tp for _, v in relevant}
         head = (f"expert counts that do not divide tp={self.tp}: {bits}. Experts "
-                f"shard by COUNT and a dummy expert is NOT inert (a zero router "
-                f"row scores 0.0 and top-k can pick it), so this cannot be padded. "
+                f"shard by COUNT, and outside the speculative draft a dummy "
+                f"expert is not safe to add, so this cannot be padded. "
                 f"vLLM will assert in _init_fused_moe_experts. ")
         if len(needs) == 1:
             need = needs.pop()
@@ -285,6 +329,7 @@ class PadPlan:
             or self.intermediate != d.intermediate
             or (self.vocab_padded is not None
                 and self.vocab_padded != _round_up(d.vocab_size, VOCAB_PAD_BASE))
+            or bool(self.expert_pads)
         )
 
     def summary(self) -> str:
@@ -303,6 +348,8 @@ class PadPlan:
         vp = self.vocab_padded
         if vp is not None and vp != _round_up(d.vocab_size, VOCAB_PAD_BASE):
             bits.append(f"vocab {_round_up(d.vocab_size, VOCAB_PAD_BASE)}->{vp}")
+        for key, old, new in self.expert_pads:
+            bits.append(f"draft experts {old}->{new} ({key.rsplit('.', 1)[-1]})")
         return ", ".join(bits) if bits else "nothing to pad"
 
 
@@ -348,6 +395,7 @@ def plan_for_tp(dims: Dims, tp: int, groups: Iterable[str] | None = None) -> Pad
         # rounding has to land on a multiple of tp as well.
         vocab_pad_to=(math.lcm(VOCAB_PAD_BASE, tp) if "vocab" in selected
                       else VOCAB_PAD_BASE),
+        expert_pads=(_draft_expert_pads(dims, tp) if "experts" in selected else ()),
     )
     _validate(plan)
     return plan
@@ -417,6 +465,11 @@ def _validate(plan: PadPlan) -> None:
 
 ZERO = "zero"
 NEG_INF = "neg_inf"
+#: a router logit low enough that top-k can never reach it, but finite. -inf in a
+#: routing score is one `0 * -inf` away from a NaN that would spread through the
+#: whole MoE output; real logits live within about +-20.
+NEG_BIG = "neg_big"
+NEG_BIG_VALUE = -1.0e4
 
 
 @dataclass(frozen=True)
@@ -441,6 +494,17 @@ def _rx(tail: str) -> "re.Pattern":
         r"(^|\.)" + re.escape(tail.lstrip(".")) +
         r"(\.(weight|weight_scale_inv|weight_scale|weight_packed|scales|scale|qweight|bias))?$"
     )
+
+
+#: the module path of a speculative draft block: `mtp.0.ffn`, `draft.1.mlp`, ...
+_DRAFT_PREFIX = r"(^|\.)(mtp|dspark|draft|eagle)\.?\d*\."
+#: its router. Split by parameter because the two halves take different fill:
+#: a dead expert's logit row is zero, its bias is what actually excludes it.
+_DRAFT_GATE_W = re.compile(_DRAFT_PREFIX + r".*\b(gate|router)\.(weight|qweight)$")
+_DRAFT_GATE_B = re.compile(
+    _DRAFT_PREFIX + r".*\b(gate|router)\.(bias|e_score_correction_bias)$")
+#: `<prefix>.experts.<id>.<rest>` inside a draft block
+_DRAFT_EXPERT_TENSOR = re.compile(_DRAFT_PREFIX + r".*\.experts\.(\d+)\.")
 
 
 def build_rules(plan: PadPlan) -> list[Rule]:
@@ -476,6 +540,15 @@ def build_rules(plan: PadPlan) -> list[Rule]:
             rule("moe", f"moe {tail} in", tail, 1, d.moe_intermediate, plan.moe_intermediate)
         if "dense" in plan.groups:
             rule("dense", f"dense {tail} in", tail, 1, d.intermediate, plan.intermediate)
+    # The draft's router grows a row per dead expert. The weight row is zero (it
+    # contributes nothing to the logit); the bias entry is NEG_BIG, which is what
+    # keeps the dead expert out of top-k. Both patterns are draft-scoped, so the
+    # backbone's 384-wide router is never touched.
+    for _key, old, new in plan.expert_pads:
+        rules.append(Rule("experts", "draft router logits", _DRAFT_GATE_W,
+                          0, old, new, ZERO))
+        rules.append(Rule("experts", "draft router bias", _DRAFT_GATE_B,
+                          0, old, new, NEG_BIG))
     return rules
 
 
@@ -496,6 +569,8 @@ def _pad_fill(rule: Rule, dtype, torch):
     is always representable and never introduces an inf or NaN.
     """
     fill = float("-inf") if rule.mode is NEG_INF else 0.0
+    if rule.mode is NEG_BIG:
+        fill = NEG_BIG_VALUE
     for name in ("float8_e8m0fnu", "float8_e8m0"):
         dt = getattr(torch, name, None)
         if dt is not None and dtype == dt:
@@ -561,6 +636,7 @@ class Padder:
         self.rules = build_rules(plan)
         self.blocks = tuple(plan.dims.blocks)
         self.count = 0
+        self.synthesized = 0
         self.by_rule: dict[str, int] = {}
 
     def __call__(self, name: str, tensor):
@@ -585,7 +661,48 @@ class Padder:
         if not self.count:
             return "padded nothing (no tensor matched a rule)"
         parts = ", ".join(f"{k} x{v}" for k, v in sorted(self.by_rule.items()))
-        return f"padded {self.count} tensor(s): {parts}"
+        out = f"padded {self.count} tensor(s): {parts}"
+        if self.synthesized:
+            out += f"; synthesized {self.synthesized} dead draft-expert tensor(s)"
+        return out
+
+    def extra(self, name: str, tensor):
+        """Dead experts to emit alongside ``name``, as (name, tensor) pairs.
+
+        A padded expert *count* is different from every other rule here: the
+        tensors for ids >= the real count do not exist in the checkpoint at all,
+        and vLLM's fused-MoE loader fills its expert slots one id at a time. A
+        slot nobody loads keeps whatever ``torch.empty`` left there, so the
+        draft would route through uninitialized memory. Emitting explicit zero
+        experts is what makes the padding inert rather than merely legal.
+
+        Keyed on expert 0 so each block emits its dummies exactly once, and
+        shaped from the tensor as it leaves ``__call__`` — already widened by the
+        moe rules, if those applied.
+        """
+        if not self.plan.expert_pads:
+            return ()
+        match = _DRAFT_EXPERT_TENSOR.search(name)
+        if match is None or match.group(3) != "0":
+            return ()
+        import torch
+
+        out = []
+        head, tail = name.split(".experts.0.", 1)
+        for _key, old, new in self.plan.expert_pads:
+            for eid in range(old, new):
+                # e8m0 holds a bare exponent and cannot represent 0; the data it
+                # scales is zero either way. Same reasoning as _pad_fill.
+                try:
+                    dead = torch.zeros_like(tensor)
+                except (RuntimeError, TypeError):
+                    dead = torch.full_like(tensor, 1.0)
+                out.append((f"{head}.experts.{eid}.{tail}", dead))
+        self.synthesized += len(out)
+        if _debug() or self.synthesized <= 8:
+            _log(f"{name} -> +{len(out)} dead expert tensor(s) "
+                 f"(ids {self.plan.expert_pads[0][1]}..{self.plan.expert_pads[0][2] - 1})")
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -655,7 +772,12 @@ def patch_weight_loader(module) -> bool:
         def make(original=original):
             def gen(*args, **kwargs):
                 for name, tensor in original(*args, **kwargs):
-                    yield name, padder(name, tensor)
+                    padded = padder(name, tensor)
+                    yield name, padded
+                    # Dead experts for a padded expert count have no entry in the
+                    # checkpoint, so they can only enter the stream here.
+                    for extra_name, extra_tensor in padder.extra(name, padded):
+                        yield extra_name, extra_tensor
             return gen
 
         setattr(module, attr, make())

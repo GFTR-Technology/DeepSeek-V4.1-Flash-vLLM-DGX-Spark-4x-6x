@@ -25,7 +25,8 @@ import sys
 
 EXPERT_RX = re.compile(r"\.experts\.(\d+)\.")
 GATE_RX = re.compile(r"(gate|router)\.(weight|e_score_correction_bias|bias)$")
-BIAS_RX = re.compile(r"e_score_correction_bias|expert_bias|routed_scaling", re.I)
+BIAS_RX = re.compile(r"e_score_correction_bias|expert_bias|routed_scaling"
+                     r"|(gate|router)\.bias$", re.I)
 
 
 def main(argv):
