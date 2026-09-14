@@ -281,11 +281,15 @@ CUDA graphs 是吞吐的关键：eager decode 在这个模型上是 host-bound �
 
 **TP 就是节点数。** 四台整除这个 checkpoint，六台不整除，vLLM 会在第一次 forward 之前就在 `divide()` 里断言失败。做法不是退回小 TP，而是把维度**向上补齐**，补出来的部分填 0 —— 0 在算术上是惰性的。
 
+这个 checkpoint 在 TP=6 下的实际计划（`python3 patch/dsv41_tp_pad/dsv41_tp_pad.py --tp 6 --model "$WEIGHTS"` 自己算，不写死）：
+
 ```
 6 台 → TP=6
-  o_groups               64 ->   66
-  num_attention_heads    64 ->   66      ← 一头一组时就是 64→66
-  moe_intermediate_size 2048 -> 2304
+  o_groups                 8 ->   12
+  num_attention_heads     64 ->   96      ← 按整组补，一组 8 个头
+  vocab（取整单位）   129280 -> 129408
+  draft 专家数           128 ->  192      ← 见下面「专家数」
+  moe_intermediate_size 2304          ← 2304/6=384，本来就整除，不动
 ```
 
 两半，必须对同一个故事：
@@ -297,26 +301,64 @@ CUDA graphs 是吞吐的关键：eager decode 在这个模型上是 host-bound �
 
 用 `sitecustomize.py` 是因为 vLLM 的 mp executor 把每个 worker 起成全新的解释器，而 `site` 在每个解释器里都会 import `sitecustomize` —— 这是唯一能覆盖所有 rank 的入口。它保持极轻：不 import torch、不 import vllm，只注册一个 post-import 钩子。
 
-**维度从 checkpoint 里读，不写死。** `config.json` 里有 `num_attention_heads` / `o_groups` / `head_dim` / `o_lora_rank` / `moe_intermediate_size` / `intermediate_size` 和 `quantization_config.weight_block_size`，`load_dims()` 读它们再校验。写死常量在权重卡被重新上传的那天就变成了谎言。
+**维度从 checkpoint 里读，不写死。** `config.json` 里有 `num_attention_heads` / `o_groups` / `head_dim` / `o_lora_rank` / `moe_intermediate_size` / `hidden_size` / `vocab_size` 和 `quantization_config.weight_block_size`，`load_dims()` 读它们再校验。写死常量在权重卡被重新上传的那天就变成了谎言。
 
 **两条必须遵守的约束：**
 
-1. **头和组一起补，以组为准。** `wo_a` 是按 `o_groups` 做的批量矩阵乘（`is_bmm=True`），每组恰好吃 `heads/groups` 个头。这个比值是权重的结构，改了等于重新切分 checkpoint。所以按**整组**补，每组带上它那一整套虚拟头：`groups' = round_up(groups, tp)`，`heads' = groups' * heads_per_group`。`groups'` 是 tp 的倍数，`heads'` 自动也是。每组输入宽度始终不变，所以 `wo_a` 的第二维不需要任何规则。
-2. **量化轴必须保持整块。** 块量化权重 `[N,K]` 带 `[N/block,K/block]` 的 scale，N 补到非 block 整数倍时 scale 行数就成了小数——根本补不了。所以 FFN 宽度补到 `tp * block` 的倍数：2048 在 TP=6、block=128 时补到 **2304**（不是 2052）。头数/组数不需要这一步：它们进张量时乘了 `head_dim` / `o_lora_rank`，本身已经是 block 的倍数。
+1. **头和组一起补，以组为准。** `wo_a` 是按 `o_groups` 做的批量矩阵乘（`is_bmm=True`），每组恰好吃 `heads/groups` 个头。这个比值是权重的结构，改了等于重新切分 checkpoint。所以按**整组**补，每组带上它那一整套虚拟头：`groups' = round_up(groups, tp)`，`heads' = groups' * heads_per_group`。本模型 `heads/groups = 64/8 = 8`，于是 `8 -> 12` 组带着 `64 -> 96` 个头。每组输入宽度始终不变，所以 `wo_a` 的第二维不需要任何规则。
+2. **量化轴必须保持整块。** 块量化权重 `[N,K]` 带 `[N/block,K/block]` 的 scale，N 补到非 block 整数倍时 scale 行数就成了小数——根本补不了。所以 FFN 宽度补到 `tp * block` 的倍数（本模型 `weight_block_size` 是 `[32,32]`）。头数/组数不需要这一步：它们进张量时乘了 `head_dim` / `o_lora_rank`，本身已经是 block 的倍数。
 
 **词表是改「取整单位」，不是补权重。** vLLM 先用 `pad_vocab_size`（默认单位 64）把词表向上取整，再按 TP 切分。这个 checkpoint 的 129280 是 64 的整数倍但不是 6 的倍数，于是在 `VocabParallelEmbedding` 里 `divide(129280, 6)` 断言失败。`vocab` 组把取整单位改成 `lcm(64, tp)`（TP=6 时是 192），得到 129408 —— 同时是 6 和 64 的整数倍。**不需要任何权重规则**：vLLM 本来就按补齐后的尺寸建 embedding，loader 只填真实行、其余留零，logits 又会切回 `org_vocab_size`，多出来的 128 行永远采样不到。TP 能整除 64 时（4、8）这一组自动无操作，所以之前一直没暴露。
 
 **Engram 不补齐。** 它按哈希列切，而 forward 本来就是「all-gather 之后切回 `n_hash_cols`」，所以除不尽时最后几个 rank 单纯什么都不持有、它们的 0 会被切掉。补齐反而是错的：行是从 `engram_vocab_size` 生成的素数，虚拟列在磁盘上没有行。只有两处原先假设这不会发生（stager 的缓冲区宽度会变成负数、空 rank 的去重读会越过表尾），已在 `patch/engram.py` 修掉，diff 见 `patch/dsv41_tp_pad/engram-uneven-tp.diff`。
 
+### 专家数：只补 draft，不碰主干
+
+专家是**按个数**切分的，所以个数必须整除 TP。这个 checkpoint 有两个专家数（`python3 tools/inspect_experts.py "$WEIGHTS"` 可以自己看）：
+
+| 在哪 | 块数 | 专家数 | mod 6 |
+|---|---|---|---|
+| 主干 `layers.0..39.ffn` | 40 | 384 | **0，本来就整除** |
+| DSpark draft `mtp.0..2.ffn` | 3 | 128 | 2，差 4 |
+
+vLLM 自己的办法 `num_redundant_experts` **修不了这个**：它是加到每个 MoE 上的同一个全局数 r，而 `384 + r ≡ 0` 和 `128 + r ≡ 0 (mod 6)` 无解。集群上反复撞到的 `n_physical_experts=388 must be divisible by tp_size=6` 就是这个死胡同。
+
+所以改成**补 draft 的个数**，主干一个字节都不动。两条理由让 draft 里的死专家无害：
+
+1. 每个块都带 `gate.bias`（每个专家一项，加在路由分数上），死专家那项填 **−1e4**，直接挤出 top-k。用 −1e4 而不是 −inf 是因为 `0 * -inf` 会产生 NaN 污染整个 MoE 输出，而真实 logit 在 ±20 量级。
+2. 就算真被选中，它权重全零，而且这是**投机草稿** —— 每个 token 都要过目标模型验证才输出。代价是接受率，也就是速度，**不可能是正确性**。
+
+这两条对主干都不成立，所以主干专家数不整除时仍然直接拒绝启动。
+
+**个数还必须是路由内核编译过的值。** `topk_softplus_sqrt_kernels.cu` 按专家数做模板特化，别的值直接报 `Unsupported expert number: 132`。它支持的是 `1 2 4 8 16 32 64 128 192 256 320 384 448 512 576`（128 以内是 2 的幂，之后是 64 的倍数），所以 TP=6 下 128 **不能补到 132**，第一个合法目标是 **192**：
+
+```bash
+./tools/kernel_expert_counts.sh 6      # 从内核源码/镜像里读出支持的值和最小合法目标
+DSV41_DRAFT_EXPERTS=192 DSV41_LANE=300k ./scripts/dsv41-serve.sh
+```
+
+代价：每块多 64 个死专家、共 3 个 `mtp` 块。按 `hidden_size` 5120、`moe_intermediate_size` 2304、`expert_dtype: fp4` 算是约 **3.2 GiB 的零**，TP=6 下每 rank 约 **0.53 GiB**。计算上是免费的 —— 死专家进不了 top-k 就分不到 token，fused MoE 不会为它们算任何东西。
+
+这个 config 里**没有** `n_group` / `topk_group`（`topk_method: noaux_tc` 不分组），所以把个数撑大不会移动任何组边界，真实专家之间的竞争关系和 128 时完全一样。
+
+两个实现细节值得知道：
+
+- 死专家的权重在 checkpoint 里**根本不存在**，而 vLLM 的 fused-MoE loader 是一个 id 一个 id 填槽位的，没人填的槽位会留着 `torch.empty` 的内存垃圾。`Padder.extra` 因此要**凭空造张量**，显式发出全零专家（e8m0 的 scale 填 1.0，因为它表示不了 0）。
+- router 那几个按专家索引的张量是**按形状找的，不是按名字**：draft 块里 dim0 等于专家数的就是专家轴。按名字猜在第一次真机启动时就错了 —— 这个 build 叫 `mtp.N.ffn.gate.bias_vl` 而不是 `gate.bias`。二维的还要求形状是 `[experts, hidden]`，因为 `index_head_dim` 恰好也是 128，否则 indexer 的权重会被误判。
+
 **第一次跑 TP≠4 之前：**
 
 ```bash
 ./scripts/dsv41-tp-probe.sh          # 只读探针：这个镜像里 shim 要挂的接缝还在吗
-python3 tests/test_tp_pad.py         # 计划 + 配置 overlay
+python3 tests/test_tp_pad.py         # 计划 + 配置 overlay + 专家补齐
 python3 tests/test_tp_pad.py --torch # + 形状与数值（在 Spark 上跑）
 ```
 
-> **状态说明。** 计划、overlay、补齐函数都有测试覆盖，但**整条路径没有在真实 checkpoint 上跑过**——本仓库从未在 TP≠4 下启动过。第一次务必用贪心参考对拍：补齐后的贪心输出必须与 TP=4 **完全一致**（`tools/postserve.sh`），因为每一片补齐都应当是算术惰性的。不一致就是补错了，不是"差不多"。另外补齐是有代价的：2048→2304 是 +12.5% 的专家 FFN 宽度，显存和每次矩阵乘都要付。
+> **状态说明。** TP=6 已经在真机上跑起来过：`DSV41_SPEC=none`（不带 DSpark）能正常加载并服务，1m 档 eager 下 14 tok/s（同条件 TP=4 eager 是 5.1）。带 DSpark 的 TP=6 需要上面的 `DSV41_DRAFT_EXPERTS=192`。
+>
+> **但是补齐后的输出正确性还没有对拍过。** 每一片补齐都应当是算术惰性的，这是推理，不是验证过的事实。第一次务必用贪心参考对拍：`temperature=0`、同一批 prompt，补齐后的输出必须与 TP=4 **完全一致**（`tools/postserve.sh`）。不一致就是补错了，不是"差不多"。
+>
+> 另外性能上 TP=6 未必划算：TP=4 全栈已实测 84.9 tok/s，六台跑 TP=6 不一定更快，先量再决定。
 
 ---
 
@@ -396,8 +438,10 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 | `DSV41_EXTRA` | — | 追加给 `vllm serve` 的参数 |
 | `DSV41_IMAGE` / `DSV41_NAME` / `DSV41_PORT` | 随 cluster.env | 临时换镜像/容器名/端口 |
 | `DSV41_SKIP_CLOCK_CHECK` | `0` | 跳过 GPU 时钟预检 |
-| `DSV41_TP_PAD_GROUPS` | `attn,dense,moe,vocab` | 只补其中某些组 |
-| `DSV41_TP_PAD_DEBUG` | — | 打印每一个被补齐的张量 |
+| `DSV41_TP_PAD_GROUPS` | `attn,dense,moe,vocab,experts` | 只补其中某些组 |
+| `DSV41_TP_PAD_DEBUG` | — | 打印每一个被补齐的张量，以及 draft 块里**没被动过**的张量（找错名字时用） |
+| `DSV41_DRAFT_EXPERTS` | 自动（`round_up(128, tp)`） | draft 专家数补到几。路由内核只接受特定值，TP=6 要显式写 `192`。见第 9 节 |
+| `DSV41_FORCE_EXPERTS` | `0` | 跳过专家数守卫硬闯（会在权重加载完之后才断言，每次约 4 分钟） |
 | `DSV41_INSTALL_NFS` | `1` | `fetch-weights.sh nfs` 自动安装缺失的 NFS 包；`0` 则只提示 |
 | `NFS_EXPORT_CLIENTS` | 自动探测 | 覆盖导出 ACL，例如 `10.10.0.0/16` 或空格分隔的地址列表（写在 `cluster.env` 里） |
 | `DSV41_NFS_OPTS` | `ro,sync,no_subtree_check` | 导出选项，需要时可加 `no_root_squash` |
@@ -435,6 +479,34 @@ DSV41_SPEC=none   ./scripts/dsv41-serve.sh   # 不加载 DSpark draft 层
 `MIN_AVAIL_GB`（默认 100）是启动前的可用内存下限：加载要吃掉 121.7 GiB 里的约 100 GiB，
 残留页缓存就是十分钟后被 OOM kill 的原因。每次启动都会先 `drop_caches` 再检查。
 
+**先确认地方是被谁占了，再动 GMU。** 一台 128 GB 的机器空闲时可用应该在 110 GiB 以上；
+日志里出现 `Available RAM: 44.79 GiB` 这类数字说明有别的东西在吃内存，这时调高 `GMU`
+只会把整机压进内存抖动（能加载完，然后失去响应）。
+
+```bash
+./scripts/dsv41-serve.sh status   # 每节点：总 / 已用 / 可用 / swap 已用
+./scripts/dsv41-serve.sh mem      # 每节点：free -g + 占内存最大的进程 + 所有容器
+```
+
+重点看三样：**swap 已用 > 0**（已经在抖了）、`docker ps -a` 里的**残留容器**（上次崩掉的
+vllm 不清干净会一直占着）、head 上的 **NFS 页缓存**（head 既跑 rank 0 又要给 worker 供 475 GB
+权重，加载过程中缓存会被重新填满）。
+
+另外下面这两条 sysctl 不是可选项：它们决定内核在这种压力下是**杀进程**还是**整机冻住**。
+本仓库的脚本不会替你改系统设置（见 [docs/RECIPE.md](docs/RECIPE.md) 第 7 步），要自己应用：
+
+```bash
+# 给后台回收留出余量。默认 44 MiB 在 128 GB 的机器上等于没有
+sudo sysctl -w vm.min_free_kbytes=1048576
+sudo sysctl -w vm.watermark_scale_factor=200
+# 想永久生效：
+echo -e "vm.min_free_kbytes=1048576\nvm.watermark_scale_factor=200" \
+  | sudo tee /etc/sysctl.d/99-dsv41.conf
+```
+
+还有 `dgx-anti-oom`：默认的容器正则（`^comfy|^vllm_nemotron`）匹配不到 `vllm_dsv41`，
+要改成能匹配的，否则它在这个场景下形同虚设。
+
 ---
 
 ## 13. 故障排查
@@ -451,6 +523,10 @@ DSV41_SPEC=none   ./scripts/dsv41-serve.sh   # 不加载 DSpark draft 层
 | `Tried to load weights of size [A] to a parameter of size [B]` | 某条补齐规则误伤了不该补的模块（典型：32 头的 indexer `wq_b`，它是 ReplicatedLinear 不分片）。现在只接受 `quantization_config.weight_block_size` 里声明的比例。`DSV41_TP_PAD_DEBUG=1` 可以打印每个被跳过的张量 |
 | `value cannot be converted to type c10::Float8_e8m0fnu without overflow` | E8M0 是纯指数格式，表示不了 0，补齐 MX scale 张量时要用 1.0（数据行已经是 0，scale 取什么都不影响）。确认 `dsv41_tp_pad.py` 是最新的 |
 | `AssertionError: 129280 is not divisible by 6` | 词表取整单位问题，见第 9 节的 `vocab` 组。确认各节点的 `patch/dsv41_tp_pad/` 已是最新 |
+| `n_physical_experts=128 must be divisible by tp_size=6` | draft 专家数不整除。`DSV41_DRAFT_EXPERTS=192`（见第 9 节）。**不要**用 `num_redundant_experts`：它是全局的，修不了主干 384 和 draft 128 同时成立 |
+| `num_redundant_experts is set but EPLB is not enabled` | 光给 `--eplb-config` 不行，要一起给 `--enable-eplb`。但对本 checkpoint 这条路本来就走不通，见上一行 |
+| `Unsupported expert number: 132` | 路由内核按专家数做模板特化，132 没编译进去。`./tools/kernel_expert_counts.sh 6` 列出合法值，TP=6 取 192 |
+| `Attempted to load weight (torch.Size([128])) into parameter (torch.Size([192]))` | 某个按专家索引的张量没被补到。`DSV41_TP_PAD_DEBUG=1` 重跑，看 `draft tensor left alone:` 那几行里的名字和形状 |
 | `Call to socket failed: Too many open files` | 容器 `nofile` 上限太低，启动器已设 `--ulimit nofile=65536`（`DSV41_NOFILE` 可调）。docker daemon 拒绝的话查 `systemctl show docker | grep -i limitnofile` |
 | `mount.nfs: access denied by server` | 导出 ACL 不含 worker 实际用的源地址（跨网段/多网卡时最常见）。worker 上 `ip route get <head>` 看 `src`，head 上 `sudo exportfs -v` 看导出给了谁；重跑 `./scripts/fetch-weights.sh nfs` 会按源地址自动重建 ACL |
 | 挂载成功但读文件 `Permission denied` | 导出路径某级父目录不是 `o+x`（`/root` 是 0700），`root_squash` 下读不了。把权重挪到 `/var/tmp/models` 并改 `cluster.env` 的 `WEIGHTS` |
@@ -479,7 +555,7 @@ DSV41_SPEC=none   ./scripts/dsv41-serve.sh   # 不加载 DSpark draft 层
 |---|---|
 | `scripts/cluster.env.example` | 拓扑模板。复制成 `cluster.env` 后编辑，这是唯一要改的文件 |
 | `scripts/lib.sh` | 共享加载器：找 `cluster.env`、拼 `NODES` 数组（head 在前）、`ssh_to`、`weights_for` |
-| `scripts/dsv41-serve.sh` | **主入口**。`start\|stop\|status\|logs\|dry-run` + 守卫 + 预检 |
+| `scripts/dsv41-serve.sh` | **主入口**。`start\|stop\|status\|mem\|logs\|logs-all [N]\|dry-run` + 守卫 + 预检 |
 | `scripts/dsv41-node-launch.sh` | 组装并下发每个 rank 的 `docker run`，worker 先起、head 最后 |
 | `scripts/dsv41-container-entrypoint.sh` | 容器内入口：挑 RoCEv2 GID index，需要时建 TP 配置 overlay |
 | `scripts/dsv41-tp-probe.sh` | TP≠4 之前的只读探针 |
@@ -490,6 +566,8 @@ DSV41_SPEC=none   ./scripts/dsv41-serve.sh   # 不加载 DSpark draft 层
 | `tests/test_tp_pad.py` | 补齐的离线测试 |
 | `scripts/engram-local.sh` | 给每个 worker 建节点本地 Engram 行副本（`status` / `--force`） |
 | `tools/engram_ranges.py` | 从 `config.json` 直接算各 rank 的 Engram 行区间（`--json` 供脚本用） |
+| `tools/inspect_experts.py` | 只读 `model.safetensors.index.json`，列出主干/draft 各有多少专家、router 长什么样 |
+| `tools/kernel_expert_counts.sh` | 路由内核支持哪些专家数，以及给定 TP 下最小的合法补齐目标 |
 | `launch/`（旧） | 原来的 `dsv41-tp4.sh <rank>` / `boot_dsv41.sh` / `bootN-go.sh`，保留可用 |
 
 其余目录（`patch/`、`build/`、`bench/`、`docs/`、`results/`）见 [README.md](README.md) 的仓库结构表。
