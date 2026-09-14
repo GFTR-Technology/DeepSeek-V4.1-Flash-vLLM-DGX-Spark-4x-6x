@@ -149,6 +149,42 @@ slots one id at a time, so a slot nobody loads keeps whatever `torch.empty` left
 in it. `Padder.extra` emits explicit zero experts (1.0 for e8m0 scales, which
 cannot represent 0) keyed on expert 0 of each draft block.
 
+The router's own per-expert tensors are found by **shape, not by name**
+(`Padder._expert_indexed`): inside a draft block a dim-0 extent equal to the
+expert count *is* the expert axis. Guessing the module name was wrong on the
+first cluster boot — this build calls it `mtp.N.ffn.gate.bias_vl`, not
+`gate.bias` — and a false positive cannot pass silently, because the parameter
+it loads into would then have the wrong size and assert. A 2-D candidate must
+also be `[experts, hidden]`: `index_head_dim` is 128, the same as the draft's
+expert count, so an indexer weight would otherwise qualify.
+
+### The count also has to be one the routing kernel was compiled for
+
+`topk_softplus_sqrt_kernels.cu` templates on the expert count and rejects
+anything else:
+
+```
+RuntimeError: topkGatingSoftplusSqrtKernelLauncher, ...:841,
+Unsupported expert number: 132
+```
+
+It dispatches on `1 2 4 8 16 32 64 128 192 256 320 384 448 512 576` — powers of
+two to 128, then multiples of 64. So at TP=6 the draft's 128 cannot go to 132;
+the first legal target is **192**, and `DSV41_DRAFT_EXPERTS=192` selects it.
+`tools/kernel_expert_counts.sh` reads that set out of the kernel source (or the
+image) for any build. The launcher passes the value into every container,
+because a rank that plans a different count than the host would disagree with
+the overlay config.
+
+Cost at 192: +64 dead experts per block over 3 `mtp` blocks. With
+`hidden_size` 5120, `moe_intermediate_size` 2304 and `expert_dtype: fp4` that is
+~3.2 GiB of zeros, ~0.53 GiB per rank at TP=6. Compute is unaffected — a dead
+expert never enters top-k, so it is never assigned a token.
+
+There is no `n_group`/`topk_group` in this config (`topk_method: noaux_tc` runs
+ungrouped), so growing the count does not move any group boundary and the real
+experts still compete exactly as they did at 128.
+
 ## Engram is not padded
 
 The Engram tables are split by hash column, and

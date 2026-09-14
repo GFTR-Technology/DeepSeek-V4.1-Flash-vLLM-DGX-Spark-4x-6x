@@ -223,6 +223,9 @@ if [ "$PAD_ACTIVE" = 1 ]; then
   )
   [ -n "${DSV41_TP_PAD_GROUPS:-}" ] && ENVV+=(-e "DSV41_TP_PAD_GROUPS=$DSV41_TP_PAD_GROUPS")
   [ -n "${DSV41_TP_PAD_DEBUG:-}" ]  && ENVV+=(-e "DSV41_TP_PAD_DEBUG=$DSV41_TP_PAD_DEBUG")
+  # The draft's padded expert count. Every rank must plan the same number the
+  # host did, or the overlay config and the weight stream disagree.
+  [ -n "${DSV41_DRAFT_EXPERTS:-}" ] && ENVV+=(-e "DSV41_DRAFT_EXPERTS=$DSV41_DRAFT_EXPERTS")
 fi
 
 # CUDA graph capture sizes. With DSpark k=5 every decode batch is a multiple of

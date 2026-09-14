@@ -470,6 +470,29 @@ def test_experts(m):
     check("the two rules do not overlap",
           bool(w.pattern.search("model.mtp.0.ffn.gate.bias")), False)
 
+    print("experts: DSV41_DRAFT_EXPERTS overrides the target count")
+    # The fused routing kernel is templated on the expert count and rejected
+    # 132 outright ("Unsupported expert number: 132"), so the smallest multiple
+    # of tp is not always reachable.
+    os.environ["DSV41_DRAFT_EXPERTS"] = "144"
+    try:
+        check("forced target used", m.plan_for_tp(d, 6).expert_pads,
+              (("text_config.dspark_n_routed_experts", 128, 144),))
+        os.environ["DSV41_DRAFT_EXPERTS"] = "130"
+        try:
+            m.plan_for_tp(d, 6)
+            check("a target that does not divide tp is refused", "no error", "SystemExit")
+        except SystemExit:
+            check("a target that does not divide tp is refused", True, True)
+        os.environ["DSV41_DRAFT_EXPERTS"] = "96"
+        try:
+            m.plan_for_tp(d, 6)
+            check("a target below the real count is refused", "no error", "SystemExit")
+        except SystemExit:
+            check("a target below the real count is refused", True, True)
+    finally:
+        del os.environ["DSV41_DRAFT_EXPERTS"]
+
     print("experts: an expert-indexed tensor is caught by shape, not by name")
     # The named rules have to guess the router module's name. The first cluster
     # boot died because that guess was wrong: "Attempted to load weight

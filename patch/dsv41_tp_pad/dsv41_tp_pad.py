@@ -99,6 +99,9 @@ class Dims:
     moe_intermediate: "int | None" = None
     intermediate: "int | None" = None
     vocab_size: "int | None" = None
+    #: not padded -- used to tell a router weight [experts, hidden] apart from
+    #: another tensor that happens to be as wide as the expert count.
+    hidden: "int | None" = None
     #: every {key: value} in the config that looks like an expert count,
     #: including any nested draft/dspark section. Experts shard by COUNT.
     expert_counts: tuple = ()
@@ -166,12 +169,36 @@ def _draft_expert_pads(dims: "Dims", tp: int) -> tuple:
 
     Neither argument transfers to the backbone, so backbone counts are never
     padded here — they fall through to ``expert_advice``.
+
+    The smallest multiple of ``tp`` is not always reachable: the fused routing
+    kernel is templated on the expert count and rejects values it was not
+    compiled for ("Unsupported expert number: 132",
+    ``topk_softplus_sqrt_kernels.cu``). ``DSV41_DRAFT_EXPERTS`` overrides the
+    target count for exactly that case -- see ``tools/kernel_expert_counts.sh``.
     """
+    forced = os.environ.get("DSV41_DRAFT_EXPERTS", "").strip()
+    want = int(forced) if forced.isdigit() else None
     pads = []
     for key, count in dims.expert_counts:
-        if count % tp == 0 or not _DRAFT_EXPERT_KEY.search(key):
+        if not _DRAFT_EXPERT_KEY.search(key):
             continue
-        pads.append((key, count, _round_up(count, tp)))
+        if want is None:
+            if count % tp == 0:
+                continue
+            target = _round_up(count, tp)
+        else:
+            if want < count:
+                raise SystemExit(
+                    f"{LOG_PREFIX} DSV41_DRAFT_EXPERTS={want} is below the "
+                    f"checkpoint's {key}={count}; experts can only be added.")
+            if want % tp:
+                raise SystemExit(
+                    f"{LOG_PREFIX} DSV41_DRAFT_EXPERTS={want} does not divide "
+                    f"tp={tp}, which is the whole point of padding it.")
+            if want == count:
+                continue
+            target = want
+        pads.append((key, count, target))
     return tuple(pads)
 
 
@@ -222,6 +249,7 @@ def load_dims(model_dir: str) -> Dims:
         moe_intermediate=opt("moe_intermediate_size"),
         intermediate=opt("intermediate_size"),
         vocab_size=opt("vocab_size"),
+        hidden=opt("hidden_size"),
         expert_counts=_expert_counts(raw),
         # The coarsest block drives the lcm rounding; the whole set drives
         # which size ratios may be read as "this is a scale of that".
@@ -671,10 +699,16 @@ class Padder:
 
         So key on the shape instead of the name: inside a draft block, a dim-0
         extent that is exactly the draft's expert count IS the expert axis.
-        Nothing else in these blocks is 128 wide -- hidden is 7168, head_dim
-        512, moe_intermediate 2304 -- and a false positive cannot pass silently,
-        because the parameter it is loaded into would then have the wrong size
-        and assert exactly as above.
+
+        A 2-D tensor must also be `[experts, hidden]`, which is what a router
+        `Linear(hidden -> n_experts)` looks like. That second test matters here:
+        `index_head_dim` is 128, the same as the draft's expert count, so an
+        indexer weight could otherwise be mistaken for a router. 1-D needs no
+        such test -- nothing else in these blocks is a bare vector of 128.
+
+        A false positive cannot pass silently either way, because the parameter
+        it is loaded into would then have the wrong size and assert exactly as
+        above.
 
         `.experts.<id>.` tensors are excluded: there the expert is in the *name*
         and dim 0 is an intermediate width.
@@ -683,6 +717,11 @@ class Padder:
         if not pads or not tensor.dim():
             return tensor
         if ".experts." in name or not _DRAFT_PREFIX_RX.search(name):
+            return tensor
+        hidden = self.plan.dims.hidden
+        if tensor.dim() == 2 and hidden and tensor.shape[1] != hidden:
+            return tensor
+        if tensor.dim() > 2:
             return tensor
         for _key, old, new in pads:
             if tensor.shape[0] != old:
@@ -727,15 +766,19 @@ class Padder:
         Keyed on expert 0 so each block emits its dummies exactly once, and
         shaped from the tensor as it leaves ``__call__`` — already widened by the
         moe rules, if those applied.
+
+        A generator, not a list: the jump from 128 to the kernel's next legal
+        count is +64 experts, and materializing 64 clones of a 16 MiB expert
+        tensor before yielding any of them is a 1 GiB spike per checkpoint
+        tensor on a box that is already short of memory.
         """
         if not self.plan.expert_pads:
-            return ()
+            return
         match = _DRAFT_EXPERT_TENSOR.search(name)
         if match is None or match.group(3) != "0":
-            return ()
+            return
         import torch
 
-        out = []
         head, tail = name.split(".experts.0.", 1)
         for _key, old, new in self.plan.expert_pads:
             for eid in range(old, new):
@@ -745,12 +788,11 @@ class Padder:
                     dead = torch.zeros_like(tensor)
                 except (RuntimeError, TypeError):
                     dead = torch.full_like(tensor, 1.0)
-                out.append((f"{head}.experts.{eid}.{tail}", dead))
-        self.synthesized += len(out)
-        if _debug() or self.synthesized <= 8:
-            _log(f"{name} -> +{len(out)} dead expert tensor(s) "
-                 f"(ids {self.plan.expert_pads[0][1]}..{self.plan.expert_pads[0][2] - 1})")
-        return out
+                self.synthesized += 1
+                yield f"{head}.experts.{eid}.{tail}", dead
+            if _debug() or self.synthesized <= new - old:
+                _log(f"{name} -> +{new - old} dead expert tensor(s) "
+                     f"(ids {old}..{new - 1})")
 
 
 # ---------------------------------------------------------------------------
