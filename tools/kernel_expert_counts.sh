@@ -93,4 +93,11 @@ if [ -z "$best" ]; then
   exit 2
 fi
 echo
-echo "smallest: DSV41_DRAFT_EXPERTS=$best DSV41_LANE=300k ./scripts/dsv41-serve.sh"
+echo "smallest: $best"
+echo
+echo "The planner already rounds up to this on its own (KERNEL_EXPERT_COUNTS in"
+echo "patch/dsv41_tp_pad/dsv41_tp_pad.py), so a normal boot needs no variable:"
+echo "  DSV41_LANE=300k ./scripts/dsv41-serve.sh"
+echo
+echo "Set one only if the list above differs from the planner's built-in set:"
+echo "  DSV41_KERNEL_EXPERT_COUNTS='$(echo "$counts" | paste -sd, -)' ./scripts/dsv41-serve.sh"

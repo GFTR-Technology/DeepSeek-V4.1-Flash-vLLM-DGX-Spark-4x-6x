@@ -330,12 +330,23 @@ vLLM 自己的办法 `num_redundant_experts` **修不了这个**：它是加到�
 
 这两条对主干都不成立，所以主干专家数不整除时仍然直接拒绝启动。
 
-**个数还必须是路由内核编译过的值。** `topk_softplus_sqrt_kernels.cu` 按专家数做模板特化，别的值直接报 `Unsupported expert number: 132`。它支持的是 `1 2 4 8 16 32 64 128 192 256 320 384 448 512 576`（128 以内是 2 的幂，之后是 64 的倍数），所以 TP=6 下 128 **不能补到 132**，第一个合法目标是 **192**：
+**个数还必须是路由内核编译过的值。** `topk_softplus_sqrt_kernels.cu` 按专家数做模板特化，别的值直接报 `Unsupported expert number: 132`。它支持的是 `1 2 4 8 16 32 64 128 192 256 320 384 448 512 576`（128 以内是 2 的幂，之后是 64 的倍数），所以 TP=6 下 128 **不能补到 132**，第一个合法目标是 **192**。
+
+所以补齐目标是**往上取整两次**：先取到 TP 的倍数，再取到内核支持的、同时还是 TP 倍数的下一个值。这一步是**自动的**，TP=6 不需要设任何环境变量：
 
 ```bash
-./tools/kernel_expert_counts.sh 6      # 从内核源码/镜像里读出支持的值和最小合法目标
-DSV41_DRAFT_EXPERTS=192 DSV41_LANE=300k ./scripts/dsv41-serve.sh
+DSV41_LANE=300k ./scripts/dsv41-serve.sh      # 自己就会算出 128 -> 192
 ```
+
+内核支持的那张表不来自 checkpoint，而是镜像的属性，所以写在 `dsv41_tp_pad.py` 的 `KERNEL_EXPERT_COUNTS` 里，并且可以覆盖：
+
+```bash
+./tools/kernel_expert_counts.sh 6      # 从内核源码/镜像里读出这个 build 真正支持的值
+DSV41_KERNEL_EXPERT_COUNTS='128,192,384' ./scripts/dsv41-serve.sh   # 表不对时改表
+DSV41_DRAFT_EXPERTS=384 ./scripts/dsv41-serve.sh                    # 直接指定目标
+```
+
+如果某个 TP 下没有任何合法值（所有内核支持的数都不整除 TP），计划会**直接拒绝启动**并告诉你改用 `DSV41_SPEC=none`，而不是算出一个会在第一次 forward 崩掉的数。
 
 代价：每块多 64 个死专家、共 3 个 `mtp` 块。按 `hidden_size` 5120、`moe_intermediate_size` 2304、`expert_dtype: fp4` 算是约 **3.2 GiB 的零**，TP=6 下每 rank 约 **0.53 GiB**。计算上是免费的 —— 死专家进不了 top-k 就分不到 token，fused MoE 不会为它们算任何东西。
 
@@ -354,7 +365,7 @@ python3 tests/test_tp_pad.py         # 计划 + 配置 overlay + 专家补齐
 python3 tests/test_tp_pad.py --torch # + 形状与数值（在 Spark 上跑）
 ```
 
-> **状态说明。** TP=6 已经在真机上跑起来过：`DSV41_SPEC=none`（不带 DSpark）能正常加载并服务，1m 档 eager 下 14 tok/s（同条件 TP=4 eager 是 5.1）。带 DSpark 的 TP=6 需要上面的 `DSV41_DRAFT_EXPERTS=192`。
+> **状态说明。** TP=6 已经在真机上跑起来过：`DSV41_SPEC=none`（不带 DSpark）能正常加载并服务，1m 档 eager 下 14 tok/s（同条件 TP=4 eager 是 5.1）。带 DSpark 的 TP=6 现在不需要额外开关 —— 计划会自动把 draft 专家数补到 192。
 >
 > **但是补齐后的输出正确性还没有对拍过。** 每一片补齐都应当是算术惰性的，这是推理，不是验证过的事实。第一次务必用贪心参考对拍：`temperature=0`、同一批 prompt，补齐后的输出必须与 TP=4 **完全一致**（`tools/postserve.sh`）。不一致就是补错了，不是"差不多"。
 >
@@ -440,7 +451,8 @@ curl -s http://$HEAD_IP:8000/v1/chat/completions -H 'Content-Type: application/j
 | `DSV41_SKIP_CLOCK_CHECK` | `0` | 跳过 GPU 时钟预检 |
 | `DSV41_TP_PAD_GROUPS` | `attn,dense,moe,vocab,experts` | 只补其中某些组 |
 | `DSV41_TP_PAD_DEBUG` | — | 打印每一个被补齐的张量，以及 draft 块里**没被动过**的张量（找错名字时用） |
-| `DSV41_DRAFT_EXPERTS` | 自动（`round_up(128, tp)`） | draft 专家数补到几。路由内核只接受特定值，TP=6 要显式写 `192`。见第 9 节 |
+| `DSV41_DRAFT_EXPERTS` | 自动（TP=6 下算出 `192`） | 直接指定 draft 专家数补到几，绕过自动取整。不在内核支持表里只会告警，不阻拦。见第 9 节 |
+| `DSV41_KERNEL_EXPERT_COUNTS` | `1,2,4,…,128,192,…,576` | 路由内核支持的专家数表。默认值是这个镜像的，换 build 时用 `tools/kernel_expert_counts.sh` 读出真实的再覆盖 |
 | `DSV41_FORCE_EXPERTS` | `0` | 跳过专家数守卫硬闯（会在权重加载完之后才断言，每次约 4 分钟） |
 | `DSV41_INSTALL_NFS` | `1` | `fetch-weights.sh nfs` 自动安装缺失的 NFS 包；`0` 则只提示 |
 | `NFS_EXPORT_CLIENTS` | 自动探测 | 覆盖导出 ACL，例如 `10.10.0.0/16` 或空格分隔的地址列表（写在 `cluster.env` 里） |
@@ -523,9 +535,9 @@ echo -e "vm.min_free_kbytes=1048576\nvm.watermark_scale_factor=200" \
 | `Tried to load weights of size [A] to a parameter of size [B]` | 某条补齐规则误伤了不该补的模块（典型：32 头的 indexer `wq_b`，它是 ReplicatedLinear 不分片）。现在只接受 `quantization_config.weight_block_size` 里声明的比例。`DSV41_TP_PAD_DEBUG=1` 可以打印每个被跳过的张量 |
 | `value cannot be converted to type c10::Float8_e8m0fnu without overflow` | E8M0 是纯指数格式，表示不了 0，补齐 MX scale 张量时要用 1.0（数据行已经是 0，scale 取什么都不影响）。确认 `dsv41_tp_pad.py` 是最新的 |
 | `AssertionError: 129280 is not divisible by 6` | 词表取整单位问题，见第 9 节的 `vocab` 组。确认各节点的 `patch/dsv41_tp_pad/` 已是最新 |
-| `n_physical_experts=128 must be divisible by tp_size=6` | draft 专家数不整除。`DSV41_DRAFT_EXPERTS=192`（见第 9 节）。**不要**用 `num_redundant_experts`：它是全局的，修不了主干 384 和 draft 128 同时成立 |
+| `n_physical_experts=128 must be divisible by tp_size=6` | draft 专家数不整除，而各节点的 `patch/dsv41_tp_pad/` 还是旧版（新版会自动补到 192，见第 9 节）。**不要**用 `num_redundant_experts`：它是全局的，修不了主干 384 和 draft 128 同时成立 |
 | `num_redundant_experts is set but EPLB is not enabled` | 光给 `--eplb-config` 不行，要一起给 `--enable-eplb`。但对本 checkpoint 这条路本来就走不通，见上一行 |
-| `Unsupported expert number: 132` | 路由内核按专家数做模板特化，132 没编译进去。`./tools/kernel_expert_counts.sh 6` 列出合法值，TP=6 取 192 |
+| `Unsupported expert number: 132` | 路由内核按专家数做模板特化，132 没编译进去。新版计划会跳过 132 直接取 192，所以这条报错说明节点上的 `dsv41_tp_pad.py` 是旧版 —— 同步一遍。这个 build 真正支持的值用 `./tools/kernel_expert_counts.sh 6` 读 |
 | `Attempted to load weight (torch.Size([128])) into parameter (torch.Size([192]))` | 某个按专家索引的张量没被补到。`DSV41_TP_PAD_DEBUG=1` 重跑，看 `draft tensor left alone:` 那几行里的名字和形状 |
 | `Call to socket failed: Too many open files` | 容器 `nofile` 上限太低，启动器已设 `--ulimit nofile=65536`（`DSV41_NOFILE` 可调）。docker daemon 拒绝的话查 `systemctl show docker | grep -i limitnofile` |
 | `mount.nfs: access denied by server` | 导出 ACL 不含 worker 实际用的源地址（跨网段/多网卡时最常见）。worker 上 `ip route get <head>` 看 `src`，head 上 `sudo exportfs -v` 看导出给了谁；重跑 `./scripts/fetch-weights.sh nfs` 会按源地址自动重建 ACL |

@@ -77,7 +77,11 @@ if [ "$TP" -gt 1 ]; then
   # It reads the real dimensions out of the checkpoint's config.json, so it
   # cannot drift from the weights the way hard-coded constants would.
   if PAD_EVAL="$(python3 "$PAD_SHIM_DIR/dsv41_tp_pad.py" --tp "$TP" --model "$WEIGHTS" --spec "$SPEC" --shell 2>&1)"; then
-    eval "$PAD_EVAL"
+    # stdout is `DSV41_*=...` assignments, but the planner also warns on stderr
+    # and both were merged above so a failure keeps its message. Only eval the
+    # assignments; a bare warning line would otherwise be run as a command.
+    eval "$(printf '%s\n' "$PAD_EVAL" | grep '^DSV41_')"
+    printf '%s\n' "$PAD_EVAL" | grep -v '^DSV41_' | sed 's/^/   /' >&2
     PAD_ACTIVE="${DSV41_PAD_ACTIVE:-0}"
     [ "$PAD_ACTIVE" = 1 ] && MODEL_DIR="/model-tp${TP}"
   else
@@ -224,8 +228,11 @@ if [ "$PAD_ACTIVE" = 1 ]; then
   [ -n "${DSV41_TP_PAD_GROUPS:-}" ] && ENVV+=(-e "DSV41_TP_PAD_GROUPS=$DSV41_TP_PAD_GROUPS")
   [ -n "${DSV41_TP_PAD_DEBUG:-}" ]  && ENVV+=(-e "DSV41_TP_PAD_DEBUG=$DSV41_TP_PAD_DEBUG")
   # The draft's padded expert count. Every rank must plan the same number the
-  # host did, or the overlay config and the weight stream disagree.
+  # host did, or the overlay config and the weight stream disagree. Both default
+  # to the same values everywhere, so neither is normally set.
   [ -n "${DSV41_DRAFT_EXPERTS:-}" ] && ENVV+=(-e "DSV41_DRAFT_EXPERTS=$DSV41_DRAFT_EXPERTS")
+  [ -n "${DSV41_KERNEL_EXPERT_COUNTS:-}" ] \
+    && ENVV+=(-e "DSV41_KERNEL_EXPERT_COUNTS=$DSV41_KERNEL_EXPERT_COUNTS")
 fi
 
 # CUDA graph capture sizes. With DSpark k=5 every decode batch is a multiple of

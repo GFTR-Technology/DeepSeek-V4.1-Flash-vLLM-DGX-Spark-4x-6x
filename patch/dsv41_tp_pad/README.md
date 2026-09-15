@@ -6,9 +6,9 @@ not, and vLLM asserts inside `divide()` — and in
 the first forward.
 
 **What this does.** Pads the dimensions UP so TP divides them, instead of
-dropping the fleet to a smaller TP. With one output group per head, 64 attention
-heads become 66 at TP=6; the two extra heads are zero and contribute exactly
-nothing.
+dropping the fleet to a smaller TP. At TP=6 this checkpoint's 8 output groups
+become 12 and its 64 attention heads become 96; the extra groups and heads are
+zero and contribute exactly nothing.
 
 Two halves, and they have to tell vLLM the same story:
 
@@ -67,12 +67,14 @@ width never moves, which is why `wo_a`'s second dimension has no rule at all.
 **2. A quantized axis must stay a whole number of blocks.** A block-quantized
 weight `[N, K]` carries a scale of `[N/block, K/block]`. Pad `N` off a block
 boundary and the scale has a fractional number of rows — the checkpoint cannot be
-padded at all. So FFN widths round to a multiple of `tp * block`:
-`moe_intermediate_size` 2048 at TP=6 with 128-wide blocks goes to **2304**, not
-2052. Head and group counts need no such rounding: they enter the tensors
-multiplied by `head_dim` / `o_lora_rank`, which are already multiples of the
-block. `_validate()` asserts the per-rank shard is still a whole number of blocks
-and refuses the plan otherwise.
+padded at all. So FFN widths round to a multiple of `tp * block`: a 2048-wide
+`moe_intermediate_size` at TP=6 with 128-wide blocks would go to **2304**, not
+2052. (This checkpoint's is already 2304 with 32-wide blocks, so it does not move
+at TP=6 — but a re-upload could change either number, which is why the rule is
+computed rather than written down.) Head and group counts need no such rounding:
+they enter the tensors multiplied by `head_dim` / `o_lora_rank`, which are
+already multiples of the block. `_validate()` asserts the per-rank shard is still
+a whole number of blocks and refuses the plan otherwise.
 
 **A padded scale cannot be filled with zero.** MX scales are stored as E8M0, a
 bare exponent: the format has no zero and no -inf, and `torch.full(..., 0.0,
@@ -123,15 +125,16 @@ two of them (`tools/inspect_experts.py`):
 | where | blocks | experts | 384 or 128 mod 6 |
 |---|---|---|---|
 | backbone `layers.0..39.ffn` | 40 | 384 | 0 — already fine |
-| DSpark draft `mtp.0..2.ffn` | 3 | 128 | 2 — needs +4 |
+| DSpark draft `mtp.0..2.ffn` | 3 | 128 | 2 — does not divide |
 
 vLLM's own remedy, `num_redundant_experts`, cannot fix this: it is a single
 global number added to every MoE, and no `r` satisfies `384 + r ≡ 0` and
 `128 + r ≡ 0 (mod 6)` at once. That is the dead end the cluster kept hitting as
 `n_physical_experts=388 must be divisible by tp_size=6`.
 
-So the plan pads the **draft's count instead**, 128 → 132, and leaves the
-backbone alone. Two things make a dead expert harmless there:
+So the plan pads the **draft's count instead**, 128 → 192 at TP=6 (why not 132
+— see below), and leaves the backbone alone. Two things make a dead expert
+harmless there:
 
 - Each block carries a `gate.bias`, one entry per expert, added to the routing
   score. A dead expert's entry is set to `NEG_BIG` (−1e4, not −inf: `0 * -inf`
@@ -143,7 +146,7 @@ backbone alone. Two things make a dead expert harmless there:
 Neither argument holds for the backbone, so a backbone count that does not
 divide TP is still refused with the `num_redundant_experts` advice.
 
-Unlike every other rule here, this one has to **create** tensors: ids 128..131
+Unlike every other rule here, this one has to **create** tensors: ids 128..191
 do not exist in the checkpoint, and vLLM's fused-MoE loader fills its expert
 slots one id at a time, so a slot nobody loads keeps whatever `torch.empty` left
 in it. `Padder.extra` emits explicit zero experts (1.0 for e8m0 scales, which
@@ -169,12 +172,26 @@ Unsupported expert number: 132
 ```
 
 It dispatches on `1 2 4 8 16 32 64 128 192 256 320 384 448 512 576` — powers of
-two to 128, then multiples of 64. So at TP=6 the draft's 128 cannot go to 132;
-the first legal target is **192**, and `DSV41_DRAFT_EXPERTS=192` selects it.
-`tools/kernel_expert_counts.sh` reads that set out of the kernel source (or the
-image) for any build. The launcher passes the value into every container,
-because a rank that plans a different count than the host would disagree with
-the overlay config.
+two to 128, then multiples of 64. So at TP=6 the draft's 128 cannot go to 132.
+
+The target is therefore rounded up **twice**: first to a multiple of `tp`, then
+on to the next count the kernel dispatches on that is *also* a multiple of `tp`
+— 128 → 132 → **192**. Both steps are automatic; no environment variable is
+needed for TP=6. A count that is legal but does not divide `tp` is skipped over
+(160 at TP=6), and if nothing in the set is reachable the plan **refuses** rather
+than emitting a number that dies at the first forward, pointing at
+`DSV41_SPEC=none`.
+
+That set is not read from the checkpoint — it belongs to the image — so it lives
+in `KERNEL_EXPERT_COUNTS` and both halves are overridable:
+
+| variable | when |
+|---|---|
+| `DSV41_KERNEL_EXPERT_COUNTS=128,192,384` | a build with a different dispatch set. `tools/kernel_expert_counts.sh` reads the real one out of the kernel source or the image |
+| `DSV41_DRAFT_EXPERTS=384` | pick the target outright. A value off the dispatch set only warns — the operator may know something the table does not |
+
+The launcher passes either into every container when set, because a rank that
+plans a different count than the host would disagree with the overlay config.
 
 Cost at 192: +64 dead experts per block over 3 `mtp` blocks. With
 `hidden_size` 5120, `moe_intermediate_size` 2304 and `expert_dtype: fp4` that is
@@ -227,11 +244,17 @@ python3 tests/test_tp_pad.py --torch   # + shapes and numerics (on a Spark)
 ## Status
 
 The plan, the overlay and the padding function are covered by the tests above.
-**The full path has not been run against the real checkpoint** — this repo has
-never booted at TP≠4. Before trusting a padded boot, run the greedy-reference
-gate against a TP=4 capture (`tools/postserve.sh`): the padded model must produce
-identical greedy output, because every padded slice is arithmetically inert. If
-it does not, the padding is wrong somewhere, not "close enough".
+TP=6 has booted on the real cluster with `DSV41_SPEC=none` (no draft), so the
+attention, vocab and overlay halves are real; the expert half has not been
+through a full boot yet.
 
-Padding also costs: `moe_intermediate_size` 2048 → 2304 is +12.5% of expert FFN
-width, in memory and in every matmul.
+**Greedy output has not been compared.** Every padded slice is arithmetically
+inert by construction, but that is an argument, not a measurement. Before
+trusting a padded boot, run the greedy-reference gate against a TP=4 capture
+(`tools/postserve.sh`): `temperature=0`, same prompts, output must be identical.
+If it is not, the padding is wrong somewhere, not "close enough".
+
+Padding also costs. At TP=6 on this checkpoint: `o_groups` 8 → 12 and heads
+64 → 96 is +50% of attention projection width, and the draft's 128 → 192 experts
+is ~0.53 GiB of zeros per rank. `moe_intermediate_size` is 2304, which already
+divides 6, so the FFN width does not move.

@@ -429,9 +429,16 @@ def test_experts(m):
           sorted(v for _, v in d.expert_counts), [128, 384])
 
     p6 = m.plan_for_tp(d, 6)
-    check("draft 128 -> 132",
-          p6.expert_pads, (("text_config.dspark_n_routed_experts", 128, 132),))
-    check("132 shards evenly over 6", 132 % 6, 0)
+    # 132 is the smallest multiple of 6, but the fused routing kernel is
+    # templated on the count and rejects it outright ("Unsupported expert
+    # number: 132"), so the plan rounds on to the next count it dispatches on.
+    check("draft 128 -> 192",
+          p6.expert_pads, (("text_config.dspark_n_routed_experts", 128, 192),))
+    check("192 shards evenly over 6", 192 % 6, 0)
+    check("192 is a count the kernel dispatches on",
+          192 in m.KERNEL_EXPERT_COUNTS, True)
+    check("132 is not, which is why it is not the target",
+          132 in m.KERNEL_EXPERT_COUNTS, False)
     check("backbone 384 needed nothing", 384 % 6, 0)
     # This is the assertion the cluster hit:
     # "n_physical_experts=128 must be divisible by tp_size=6".
@@ -454,10 +461,10 @@ def test_experts(m):
     rules = {r.what: r for r in m.build_rules(p6)}
     w = rules.get("draft router logits")
     b = rules.get("draft router bias")
-    check("logit rows zero-filled 128 -> 132",
-          (w.old, w.new, w.mode), (128, 132, m.ZERO))
+    check("logit rows zero-filled 128 -> 192",
+          (w.old, w.new, w.mode), (128, 192, m.ZERO))
     check("bias entries pushed out of top-k",
-          (b.old, b.new, b.mode), (128, 132, m.NEG_BIG))
+          (b.old, b.new, b.mode), (128, 192, m.NEG_BIG))
     check("bias is finite (-inf would risk 0 * -inf = NaN)",
           m.NEG_BIG_VALUE < -1000 and m.NEG_BIG_VALUE == m.NEG_BIG_VALUE, True)
     for name in ("model.layers.0.ffn.gate.weight", "model.layers.7.ffn.gate.bias"):
@@ -470,14 +477,36 @@ def test_experts(m):
     check("the two rules do not overlap",
           bool(w.pattern.search("model.mtp.0.ffn.gate.bias")), False)
 
+    print("experts: the kernel's dispatch set is what makes 192 the target")
+    # Nothing here is read from the checkpoint -- the set belongs to the image,
+    # so it is overridable, and a build that really did accept 132 would use it.
+    os.environ["DSV41_KERNEL_EXPERT_COUNTS"] = "128,132,256"
+    try:
+        check("a build that accepts 132 stops at 132",
+              m.plan_for_tp(d, 6).expert_pads,
+              (("text_config.dspark_n_routed_experts", 128, 132),))
+        os.environ["DSV41_KERNEL_EXPERT_COUNTS"] = "128 256 512"
+        check("a count that already divides tp is left alone",
+              m.plan_for_tp(d, 8).expert_pads, ())
+        os.environ["DSV41_KERNEL_EXPERT_COUNTS"] = "128,160,192"
+        check("a legal count that does not divide tp is skipped over",
+              m.plan_for_tp(d, 6).expert_pads,
+              (("text_config.dspark_n_routed_experts", 128, 192),))
+        os.environ["DSV41_KERNEL_EXPERT_COUNTS"] = "128,160"
+        try:
+            m.plan_for_tp(d, 6)
+            check("no reachable count is refused, not silently wrong",
+                  "no error", "SystemExit")
+        except SystemExit:
+            check("no reachable count is refused, not silently wrong", True, True)
+    finally:
+        del os.environ["DSV41_KERNEL_EXPERT_COUNTS"]
+
     print("experts: DSV41_DRAFT_EXPERTS overrides the target count")
-    # The fused routing kernel is templated on the expert count and rejected
-    # 132 outright ("Unsupported expert number: 132"), so the smallest multiple
-    # of tp is not always reachable.
-    os.environ["DSV41_DRAFT_EXPERTS"] = "144"
+    os.environ["DSV41_DRAFT_EXPERTS"] = "384"
     try:
         check("forced target used", m.plan_for_tp(d, 6).expert_pads,
-              (("text_config.dspark_n_routed_experts", 128, 144),))
+              (("text_config.dspark_n_routed_experts", 128, 384),))
         os.environ["DSV41_DRAFT_EXPERTS"] = "130"
         try:
             m.plan_for_tp(d, 6)
@@ -490,6 +519,12 @@ def test_experts(m):
             check("a target below the real count is refused", "no error", "SystemExit")
         except SystemExit:
             check("a target below the real count is refused", True, True)
+        # An override the kernel does not list only warns: the operator may know
+        # something this table does not.
+        os.environ["DSV41_DRAFT_EXPERTS"] = "144"
+        check("an override off the dispatch set is still honoured",
+              m.plan_for_tp(d, 6).expert_pads,
+              (("text_config.dspark_n_routed_experts", 128, 144),))
     finally:
         del os.environ["DSV41_DRAFT_EXPERTS"]
 
@@ -514,7 +549,7 @@ def test_experts(m):
     spec.loader.exec_module(ov)
     cfg = ov.rewrite_config(json.loads(json.dumps(EXPERTS)), p6)
     check("draft count rewritten",
-          cfg["text_config"]["dspark_n_routed_experts"], 132)
+          cfg["text_config"]["dspark_n_routed_experts"], 192)
     check("backbone count left alone",
           cfg["text_config"]["n_routed_experts"], 384)
     check("the rewrite is recorded for the log",

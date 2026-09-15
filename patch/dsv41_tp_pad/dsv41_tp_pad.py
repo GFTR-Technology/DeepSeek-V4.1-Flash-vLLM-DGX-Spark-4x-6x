@@ -148,6 +148,31 @@ _DRAFT_EXPERT_KEY = re.compile(r"dspark|draft|mtp|eagle|specul", re.I)
 _EXPERT_KEY = re.compile(r"(^|_)(n_routed_experts|num_experts|n_experts"
                          r"|n_physical_experts|num_local_experts)$")
 
+#: The expert counts the fused routing kernel was compiled for. It is templated
+#: on the count and rejects everything else at the first forward:
+#:
+#:   RuntimeError: topkGatingSoftplusSqrtKernelLauncher,
+#:   .../moe/topk_softplus_sqrt_kernels.cu:841, Unsupported expert number: 132
+#:
+#: so the pad target has to be a multiple of tp AND a member of this set. Powers
+#: of two to 128, then multiples of 64. Unlike the dimensions above this does not
+#: come from the checkpoint -- it is a property of the image, so
+#: ``DSV41_KERNEL_EXPERT_COUNTS`` overrides it and
+#: ``tools/kernel_expert_counts.sh`` reads the real set out of any build.
+KERNEL_EXPERT_COUNTS = (1, 2, 4, 8, 16, 32, 64, 128,
+                        192, 256, 320, 384, 448, 512, 576)
+
+
+def _kernel_expert_counts() -> tuple:
+    raw = os.environ.get("DSV41_KERNEL_EXPERT_COUNTS", "").strip()
+    if not raw:
+        return KERNEL_EXPERT_COUNTS
+    vals = tuple(sorted({int(v) for v in re.split(r"[,\s]+", raw) if v.isdigit()}))
+    if not vals:
+        raise SystemExit(f"{LOG_PREFIX} DSV41_KERNEL_EXPERT_COUNTS={raw!r} has "
+                         f"no integers in it.")
+    return vals
+
 
 def _draft_expert_pads(dims: "Dims", tp: int) -> tuple:
     """Expert counts we may grow by adding dead experts — the draft's only.
@@ -173,19 +198,40 @@ def _draft_expert_pads(dims: "Dims", tp: int) -> tuple:
     The smallest multiple of ``tp`` is not always reachable: the fused routing
     kernel is templated on the expert count and rejects values it was not
     compiled for ("Unsupported expert number: 132",
-    ``topk_softplus_sqrt_kernels.cu``). ``DSV41_DRAFT_EXPERTS`` overrides the
-    target count for exactly that case -- see ``tools/kernel_expert_counts.sh``.
+    ``topk_softplus_sqrt_kernels.cu``). So the target is rounded up twice --
+    first to a multiple of ``tp``, then to the next count the kernel dispatches
+    on (``KERNEL_EXPERT_COUNTS``) that is *also* a multiple of ``tp``. At TP=6
+    that turns 128 into 192, not 132, with no environment variable set.
+    ``DSV41_DRAFT_EXPERTS`` overrides the target outright and
+    ``DSV41_KERNEL_EXPERT_COUNTS`` overrides the set -- see
+    ``tools/kernel_expert_counts.sh``, which reads it out of the image.
     """
     forced = os.environ.get("DSV41_DRAFT_EXPERTS", "").strip()
     want = int(forced) if forced.isdigit() else None
+    legal = _kernel_expert_counts()
+    if want is not None and want not in legal:
+        _log(f"warning: DSV41_DRAFT_EXPERTS={want} is not one of the counts "
+             f"this kernel dispatches on ({' '.join(map(str, legal))}); "
+             f"expect 'Unsupported expert number: {want}' at the first forward.")
     pads = []
     for key, count in dims.expert_counts:
         if not _DRAFT_EXPERT_KEY.search(key):
             continue
         if want is None:
-            if count % tp == 0:
+            if count % tp == 0 and count in legal:
                 continue
             target = _round_up(count, tp)
+            if target not in legal:
+                reachable = [n for n in legal if n >= target and n % tp == 0]
+                if not reachable:
+                    raise SystemExit(
+                        f"{LOG_PREFIX} {key}={count} has to grow to a multiple "
+                        f"of tp={tp}, but no count this kernel dispatches on "
+                        f"({' '.join(map(str, legal))}) is both >= {target} and "
+                        f"a multiple of {tp}. Run this TP without the draft "
+                        f"(DSV41_SPEC=none), or check the real set with "
+                        f"tools/kernel_expert_counts.sh {tp}.")
+                target = reachable[0]
         else:
             if want < count:
                 raise SystemExit(
